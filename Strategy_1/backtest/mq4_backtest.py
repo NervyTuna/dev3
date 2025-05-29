@@ -240,10 +240,8 @@ def start_session(sess: SessionData, price, dDate, dt):
     sess.openPrice = price
     sess.highPrice = price
     sess.lowPrice = price
-    logging.debug(
-        f"Session1 start at {price:.2f}",
-        extra={"sim_time": fmt_sim_time(dt)}
-    )
+    logging.debug(f"{sess.name} start at {price:.2f}",  # ✓ Use dynamic session name
+                  extra={"sim_time": fmt_sim_time(dt)})
 
 def end_session(sess: SessionData):
     logging.debug(f"{sess.name} end.")
@@ -456,12 +454,12 @@ def check_sweeps(dt, price):
                 close_trade(tr, price, reason)
 
 def check_outside_sessions(dt, price):
-    s1_in= in_time_window(dt, *SESSION1_START, *SESSION1_END)
-    s2_in= in_time_window(dt, *SESSION2_START, *SESSION2_END)
+    s1_in = in_time_window(dt, *SESSION1_START, *SESSION1_END)
+    s2_in = in_time_window(dt, *SESSION2_START, *SESSION2_END)
     if not s1_in and not s2_in:
-        tr= state["activeTrade"]
-        if tr and tr.active:
-            close_trade(tr, price, "OutsideSessions", dt)
+        for tr in list(state["activeTrades"].values()):  # ✓ Updated to use activeTrades
+            if tr and tr.active:
+                close_trade(tr, price, "OutsideSessions", dt)
 
 def check_volatility(dt, price):
     # overnight
@@ -551,7 +549,7 @@ def run_backtest(csvPath, yrs, srcTz, dstTz, quiet=False):
                 try_open_trade(dt, price, state["session2"], 2)
             manage_trade(dt, price)
 
-    for tr in state["activeTrades"].values():
+    for tr in state["activeTrades"].values():  # Iterate over activeTrades
         if tr and tr.active:
             close_trade(tr, tr.entry, "EndOfBacktest", dt)
 
