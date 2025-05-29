@@ -1,0 +1,33 @@
+# MetaTrader-related
+*.hst
+*.log
+*.bak
+*.mq4~
+*.ex4
+
+# Strategy tester output
+*.csv        # Covers dax-1m.csv and other exports
+*.html
+*.xml
+
+# Python/Node/IDE junk
+__pycache__/
+*.pyc
+.env
+.DS_Store
+.vscode/
+node_modules/
+
+# Git LFS tracked files (ensure not double-tracked)
+!.gitattributes
+
+# OneDrive temp files
+~$*
+
+# Backups and temporary
+*.tmp
+*.swp
+*.swo
+Javascript_api/o1_builds/v1_1/dax-1m.csv
+Javascript_api/o1_builds/v1_1/dax-1m.csv
+Javascript_api/o1_builds/v1_1/dax-1m.csv

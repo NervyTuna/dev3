@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title><%= pageTitle %></title>
+  <link rel="stylesheet" href="/style.css" />
+  <!-- Optionally load Chart.js from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- Load Socket.io client script from the server -->
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+<div class="header">
+  <h1>DAX30 Trading Dashboard</h1>
+  <p class="subtitle">Live logs, open positions, market data</p>
+</div>
+
+<div class="main-content">
+  <div class="left-pane">
+    <h2>Account Info</h2>
+    <div id="balanceSection">Loading balance...</div>
+    
+    <h2>Open Trade</h2>
+    <div id="openTradeSection">No open trade.</div>
+    
+    <h2>Closed Trades (Today)</h2>
+    <ul id="closedTradesList"></ul>
+  </div>
+  
+  <div class="right-pane">
+    <h2>GER30(£) Price</h2>
+    <div id="daxPriceSection">--</div>
+    <canvas id="priceChart" width="400" height="200"></canvas>
+    
+    <h2>Log Events (Today)</h2>
+    <div id="logsContainer" class="logs-box"></div>
+  </div>
+</div>
+
+<script>
+  // We’ll do a basic front-end script that fetches data from /api endpoints
+  // and also listens to updates via Socket.io
+
+  const socket = io();
+
+  // we’ll store chart data here
+  let chart;
+  let chartData = {
+    labels: [],
+    prices: []
+  };
+
+  function initChart() {
+    const ctx = document.getElementById("priceChart").getContext("2d");
+    chart = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels: chartData.labels,
+        datasets: [{
+          label: "DAX Price",
+          data: chartData.prices,
+          borderColor: "rgb(255,99,132)",
+          fill: false
+        }]
+      },
+      options: {
+        scales: {
+          x: {
+            display: false // hide x-axis labels for neatness
+          }
+        }
+      }
+    });
+  }
+
+  // function to refresh chart when we get new price
+  function updateChart(price) {
+    const now = new Date();
+    const label = now.toTimeString().split(" ")[0];
+    chartData.labels.push(label);
+    chartData.prices.push(price);
+    if (chartData.labels.length > 100) {
+      // remove oldest
+      chartData.labels.shift();
+      chartData.prices.shift();
+    }
+    chart.update();
+  }
+
+  // fetch balance once
+  function loadBalance() {
+    fetch("/api/balance")
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById("balanceSection").innerHTML = "Equity: " + data.equity;
+      });
+  }
+
+  // fetch closed trades once
+  function loadClosedTrades() {
+    fetch("/api/closedTrades")
+      .then(r => r.json())
+      .then(data => {
+        const list = document.getElementById("closedTradesList");
+        list.innerHTML = "";
+        data.forEach(trade => {
+          const li = document.createElement("li");
+          li.textContent = `[${trade.timestamp}] session=${trade.details.session}, points=${trade.details.points}, reason=${trade.details.reason}`;
+          list.appendChild(li);
+        });
+      });
+  }
+
+  // fetch logs once (will also get real-time updates from socket)
+  function loadLogs() {
+    fetch("/api/logs")
+      .then(r => r.json())
+      .then(data => {
+        renderLogs(data);
+      });
+  }
+
+  // render logs in the logsContainer
+  function renderLogs(logArray) {
+    const container = document.getElementById("logsContainer");
+    container.innerHTML = "";
+    logArray.forEach(entry => {
+      const div = document.createElement("div");
+      div.className = "log-line";
+      div.textContent = `[${entry.timestamp}] [${entry.eventType}] ${JSON.stringify(entry.details)}`;
+      container.appendChild(div);
+    });
+    container.scrollTop = container.scrollHeight; // scroll to bottom
+  }
+
+  // fetch open trade
+  function loadOpenTrade() {
+    fetch("/api/activeTrade")
+      .then(r => r.json())
+      .then(data => {
+        renderOpenTrade(data);
+      });
+  }
+
+  function renderOpenTrade(trade) {
+    const sect = document.getElementById("openTradeSection");
+    if (!trade || !trade.direction) {
+      sect.textContent = "No open trade.";
+      return;
+    }
+    const str = `Direction: ${trade.direction}, Entry: ${trade.entryPrice}, Size: ${trade.size}, Session: ${trade.sessionId}`;
+    sect.textContent = str;
+  }
+
+  // fetch DAX price
+  function loadDaxPrice() {
+    fetch("/api/daxPrice")
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById("daxPriceSection").textContent = data.price;
+        if (chart) updateChart(data.price);
+      });
+  }
+
+  // Socket.io event listeners for real-time updates
+  socket.on("activeTrade", data => {
+    renderOpenTrade(data);
+  });
+  socket.on("logs", data => {
+    renderLogs(data);
+  });
+
+  // on load
+  document.addEventListener("DOMContentLoaded", () => {
+    initChart();
+    loadBalance();
+    loadOpenTrade();
+    loadClosedTrades();
+    loadLogs();
+    loadDaxPrice();
+
+    // poll every X seconds
+    setInterval(() => {
+      loadDaxPrice();
+      loadOpenTrade();
+      loadClosedTrades();
+    }, 15000);
+  });
+</script>
+</body>
+</html>

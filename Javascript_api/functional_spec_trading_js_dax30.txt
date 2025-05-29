@@ -1,0 +1,127 @@
+Functional Specification: JavaScript-Based Trading Platform (GER30 Index)
+Generated: 2025-05-24 17:58 UTC
+
+-------------------------------------------------------------------------------
+PROJECT OVERVIEW
+-------------------------------------------------------------------------------
+This application automates a trading strategy for the DAX 30 index (GER30) via the IG.com REST API using JavaScript/Node.js. It mirrors the exact logic defined in the MQL4 implementation ("codex_v1_1.mq4") and strategy brief ("trading_strategy_stuart.docx"). The system manages trades based on UK trading sessions, price zones, retraction logic, and strict entry/exit rules with guaranteed stop-loss enforcement.
+
+-------------------------------------------------------------------------------
+CORE FUNCTIONALITY
+-------------------------------------------------------------------------------
+
+1. SESSION MANAGEMENT
+- Two sessions per day:
+  * Session 1: 08:00–12:30 UK time
+  * Session 2: 14:30–17:16 UK time
+- Track open price at session start.
+- Track dynamic session high and low from first tick until session end.
+
+2. ENTRY RULES
+- Entry Zones defined relative to session open price:
+  Session 1:
+    08:16–09:05 (45 pts), 09:30–09:45 (45 pts), 10:15–10:45 (70 pts),
+    10:45–11:45 (45 pts)
+  Session 2:
+    14:46–15:06 (45 pts), 15:15–15:45 (70 pts), 15:45–16:48 (45 pts)
+
+- Trades must:
+  * Be 45+ points from session open.
+  * Use opposite direction from price movement.
+  * Be adjusted for tolerance (9 pts) and retraction logic.
+  * Carry a 40 index point stop-loss.
+  * Be skipped if SL cannot be placed.
+
+3. TOLERANCE & RETRACTION HANDLING
+- Tolerance: 9 points. Allows a breach but not closer to open.
+- Retraction tiers:
+  * 15–29.9 pts → Entry adjusted 18 pts beyond session H/L.
+  * 30–35.9 pts → Advance to next level.
+  * 36–45.9 pts → Skip next level.
+  * 46+ pts → Cancel all future trades (if no trade is open).
+
+- Recursive handling:
+  * Recheck breach and retraction each time to determine furthest valid entry.
+
+4. EXIT RULES
+- Level 45–69.9:
+  * Close at breakeven if 15 pts adverse and price returns.
+  * Else, close at start of 16th minute from peak opposite to trade.
+- Level 70–139:
+  * Close at start of 31st minute from peak opposite to trade.
+- Special rule:
+  * If opened 08:16–09:05, and trade goes 15 against → close at 09:31.
+  * All 70+ trades → force close at 09:31.
+- 40-point SL always enforced.
+
+5. VOLATILITY FILTERS
+- No trades if:
+  * 17:16–08:00 next day shows 200+ pt move (cancels Session 1).
+  * 12:00–14:30 shows 150+ pt move (cancels Session 2).
+- Sweeps: Every 1 minute check:
+  * 1231–1429 and 1716–0759 → close all trades.
+  * Price > 179 pts from session open → close all trades.
+
+6. RISK MANAGEMENT
+- Lot size = AccountBalance / 800.
+- One trade per session maximum.
+
+7. ERROR HANDLING
+- Retry trade open/close up to 5 times.
+- Check if order can be opened with required SL before sending.
+
+8. DYNAMIC SPREAD ADJUSTMENT
+- Spread reference:
+  01:15–08:00  = 4.0 pts
+  08:00–09:00  = 2.0 pts
+  09:00–17:30  = 1.2 pts
+  17:30–22:00  = 2.0 pts
+  22:00–01:15  = 5.0 pts
+
+-------------------------------------------------------------------------------
+CONFIGURATION OPTIONS
+-------------------------------------------------------------------------------
+Editable via .txt or .json:
+- Active trading zone times and point distances
+- Tolerance (default: 9 pts)
+- Retraction tiers and values
+- Closing minute rules per level
+- Session times
+
+-------------------------------------------------------------------------------
+LOGGING AND BACKTEST SUPPORT
+-------------------------------------------------------------------------------
+- Every trade will log:
+  * Session
+  * Entry time
+  * Entry level
+  * Direction
+  * Stop-loss level
+  * Closing rule used
+  * Exit time
+  * Result (points)
+
+- Trade logic will support Python-based backtesting with 1-minute bars.
+
+-------------------------------------------------------------------------------
+ENVIRONMENT & INTEGRATIONS
+-------------------------------------------------------------------------------
+- IG API integration via Node.js (preferred library: wagerfield/ig-api)
+- Authentication managed with API key, username, password
+--Username: javascript_api
+--Password: Newzealand6
+--API Key: d9e432394ff4ad5de9b061b35e927a2983bc1569
+- Hosted on VPS (UK server recommended for latency)
+- Optional GUI/web dashboard
+- Optional Excel-based live tracking (RTD), not used for backtesting
+
+-------------------------------------------------------------------------------
+STATUS
+-------------------------------------------------------------------------------
+Strategy logic confirmed in MQL4 script and translated for JS implementation.
+Next steps:
+- Modularize strategy into JS backend
+- Connect IG API endpoints
+- Implement logging + test with 2024 DAX data
+
+-------------------------------------------------------------------------------

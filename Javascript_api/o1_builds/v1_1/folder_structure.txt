@@ -1,0 +1,13 @@
+project/
+├── index.js           // Your main logic runner (unchanged except a small tweak to use Socket.io, optional)
+├── igApiClient.js
+├── logger.js
+├── strategyLogic.js
+├── config.js
+├── server.js          // NEW: Express + Socket.io server
+├── views/             // EJS templates
+│   └── index.ejs
+├── public/            // static front-end assets
+│   ├── style.css
+│   └── chart.js       // we can fetch from CDN, or place it here
+└── logs/              // your daily log files

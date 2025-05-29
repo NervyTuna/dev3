@@ -1,0 +1,35 @@
+Below is the general way to run your backtest.py script on Windows, specifying which years to process:
+
+Open either Command Prompt or PowerShell.
+
+Navigate (cd) to the folder containing your script and CSV. For example:
+
+bash
+Copy
+cd "C:\Users\stuar\OneDrive\Documents\Working\Trading\dev2\Javascript_api\o1_builds\v1_1"
+Run the script with Python, pointing to your CSV and specifying a year or range via --year_range.
+
+Examples
+Single year (e.g., 2024):
+
+bash
+Copy
+python backtest.py --csv "dax-1m.csv" --year_range "2024"
+Range of years (e.g., 2000 to 2003):
+
+bash
+Copy
+python backtest.py --csv "dax-1m.csv" --year_range "2000-2003"
+Another single year (e.g., 2010):
+
+bash
+Copy
+python backtest.py --csv "dax-1m.csv" --year_range "2010"
+Another single year (e.g., 2020):
+
+bash
+Copy
+python backtest.py --csv "dax-1m.csv" --year_range "2020"
+(If you don’t have python in your PATH, you might need to use py or the full path to python, e.g. C:\Users\stuar\AppData\Local\Programs\Python\Python310\python backtest.py ...)
+
+These commands will process only the specified years (or year ranges) from dax-1m.csv. The script then prints out each closed trade, plus monthly and yearly P/L in points.
