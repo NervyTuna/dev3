@@ -37,6 +37,17 @@ MIDDAY_LIMIT    = 150.0
 TIME_CLOSE_45_69   = 16
 TIME_CLOSE_70_PLUS = 31
 
+# Dynamic spread schedule (index points)
+SPREAD_SCHEDULE = [
+    ((1, 15),  (8, 0),  4.0),
+    ((8, 0),   (9, 0),  2.0),
+    ((9, 0),   (17, 30), 1.2),
+    ((17, 30), (22, 0), 2.0),
+    ((22, 0),  (23, 59), 5.0),
+    ((0, 0),   (1, 15), 5.0),
+]
+DEFAULT_SPREAD = 5.0
+
 RETRACTION_TABLE = [
     (15.0, 29.9, 0, 18.0),
     (30.0, 35.9, 1, 0.0),
@@ -44,24 +55,24 @@ RETRACTION_TABLE = [
     (46.0, 9999.0, -1, 0.0),
 ]
 
-DIST_LEVELS = [45,70,100,130]
+DIST_LEVELS = [45, 70, 100, 130]
 
-SESSION1_START = (8,0)
-SESSION1_END   = (12,30)
+SESSION1_START = (8, 0)
+SESSION1_END   = (12, 30)
 
-SESSION2_START = (14,30)
-SESSION2_END   = (17,16)
+SESSION2_START = (14, 30)
+SESSION2_END   = (17, 16)
 
 SESSION1_ZONES = [
-    ((8,16),  (9,5),  (9,31), 1, 45, True),   # noCloseRules => skip 16/31
-    ((9,30),  (9,45), (10,6), 2, 45, False),
-    ((10,15), (10,45),(12,31),3, 70, False),
-    ((10,45), (11,45),(12,31),4, 45, False),
+    ((8, 16),  (9, 5),  (9, 31), 1, 45, True),   # noCloseRules => skip 16/31
+    ((9, 30),  (9, 45), (10, 6), 2, 45, False),
+    ((10, 15), (10, 45), (12, 31), 3, 70, False),
+    ((10, 45), (11, 45), (12, 31), 4, 45, False),
 ]
 SESSION2_ZONES = [
-    ((14,46),(15,6), (17,16),1, 45, False),
-    ((15,15),(15,45),(17,16),2, 70, False),
-    ((15,45),(16,48),(17,16),3, 45, False),
+    ((14, 46), (15, 6), (17, 16), 1, 45, False),
+    ((15, 15), (15, 45), (17, 16), 2, 70, False),
+    ((15, 45), (16, 48), (17, 16), 3, 45, False),
 ]
 
 # -------------------------------------------------------------------------
@@ -74,11 +85,12 @@ class SessionData:
         self.endM   = endM
         self.active = False
         self.dayDate  = None
-        self.openPrice= None
-        self.highPrice= None
-        self.lowPrice = None
-        self.allowed  = True
-        self.zones    = zones
+        self.openPrice = None
+        self.highPrice = None
+        self.lowPrice  = None
+        self.allowed   = True
+        self.zones     = zones
+        self.used      = set()
 
 class Trade:
     def __init__(self, direction, entryPrice, sessionID, zoneID,
@@ -90,7 +102,7 @@ class Trade:
         self.forcedClose = forcedClose
         self.openTime    = openTime
         self.finalDist   = finalDist
-        self.noCloseRules= noClose
+        self.noCloseRules = noClose
         self.peakHigh    = entryPrice
         self.peakLow     = entryPrice
         self.peakTime    = openTime
@@ -102,13 +114,27 @@ class Trade:
 state = {
     "session1": SessionData("Session1", *SESSION1_START, *SESSION1_END, SESSION1_ZONES),
     "session2": SessionData("Session2", *SESSION2_START, *SESSION2_END, SESSION2_ZONES),
-    "activeTrade": None,
+    "activeTrades": {1: None, 2: None},
     "closedTrades": [],
     "overnightRef": None,
     "middayRef": None
 }
 
 # -------------------------------------------------------------------------
+def get_spread(dt):
+    """Return spread value for the given datetime."""
+    t = dt.time()
+    for (st, en, val) in SPREAD_SCHEDULE:
+        st_t = time(*st)
+        en_t = time(*en)
+        if st_t <= en_t:
+            if st_t <= t <= en_t:
+                return val
+        else:  # wrap midnight
+            if t >= st_t or t <= en_t:
+                return val
+    return DEFAULT_SPREAD
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True,
@@ -157,6 +183,9 @@ def handle_daily_reset(dt):
         state['currentDate'] = current_date
         state["session1"].allowed = True
         state["session2"].allowed = True
+        state["session1"].used = set()
+        state["session2"].used = set()
+        state["activeTrades"] = {1: None, 2: None}
         logging.debug(f"Daily reset: {current_date} - sessions allowed.")
 
 def parse_year_range(rng):
@@ -283,7 +312,7 @@ def pick_final_distance(baseDist, skip, shift):
     return finalDist
 
 def try_open_trade(dt, price, sess: SessionData, sID: int):
-    if state["activeTrade"] is not None:
+    if state["activeTrades"][sID] is not None:
         return
     z = get_active_zone(dt, sess)
     if z is None:
@@ -313,7 +342,7 @@ def try_open_trade(dt, price, sess: SessionData, sID: int):
         return
 
     tr = Trade(direction, price, sID, zoneID, forcedC, dt, finalDist, noClose)
-    state["activeTrade"] = tr
+    state["activeTrades"][sID] = tr
 
     logging.debug(  # Changed from logging.info to logging.debug
         "OPEN  s%d z%d %-4s entry=%.1f final=%d  forced=%s  noClose=%s",
@@ -323,55 +352,55 @@ def try_open_trade(dt, price, sess: SessionData, sID: int):
     )
 
 def manage_trade(dt, price):
-    tr= state["activeTrade"]
-    if not tr or not tr.active:
-        return
+    for sID, tr in state["activeTrades"].items():
+        if not tr or not tr.active:
+            continue
 
-    # forced close
-    if dt >= tr.forcedClose:
-        close_trade(tr, price, "ForcedClose", dt)
-        return
+        # forced close
+        if dt >= tr.forcedClose:
+            close_trade(tr, price, "ForcedClose", dt)
+            continue
 
-    dd= abs(price- tr.entry)
-    if dd >= GSL:
-        close_trade(tr, price, "GSL", dt)
-        return
+        dd= abs(price- tr.entry)
+        if dd >= GSL:
+            close_trade(tr, price, "GSL", dt)
+            continue
 
-    # update peaks
-    if tr.direction=="BUY":
-        if price> tr.peakHigh:
-            tr.peakHigh= price
-            tr.peakTime= dt
-        if price< tr.peakLow:
-            tr.peakLow= price
-            tr.peakTime= dt
-    else:
-        if price< tr.peakLow:
-            tr.peakLow= price
-            tr.peakTime= dt
-        if price> tr.peakHigh:
-            tr.peakHigh= price
-            tr.peakTime= dt
+        # update peaks
+        if tr.direction=="BUY":
+            if price> tr.peakHigh:
+                tr.peakHigh= price
+                tr.peakTime= dt
+            if price< tr.peakLow:
+                tr.peakLow= price
+                tr.peakTime= dt
+        else:
+            if price< tr.peakLow:
+                tr.peakLow= price
+                tr.peakTime= dt
+            if price> tr.peakHigh:
+                tr.peakHigh= price
+                tr.peakTime= dt
 
-    if tr.noCloseRules:
-        return
+        if tr.noCloseRules:
+            continue
 
-    if tr.finalDist>=45 and tr.finalDist<70:
-        adv= (tr.entry- price) if tr.direction=="BUY" else (price- tr.entry)
-        if adv>=15:
-            diff= abs(price- tr.entry)
-            if diff<1.0:
-                # Break-even
-                close_trade(tr, price, "BreakEven15", dt)
-                return
-        holdMins= minutes_diff(tr.peakTime, dt)
-        if holdMins>= TIME_CLOSE_45_69:
-            # Time-based exits
-            close_trade(tr, price, "TimeClose16", dt)
-    else:
-        holdMins= minutes_diff(tr.peakTime, dt)
-        if holdMins>= TIME_CLOSE_70_PLUS:
-            close_trade(tr, price, "TimeClose31", dt)
+        if tr.finalDist>=45 and tr.finalDist<70:
+            adv= (tr.entry- price) if tr.direction=="BUY" else (price- tr.entry)
+            if adv>=15:
+                diff= abs(price- tr.entry)
+                if diff<1.0:
+                    # Break-even
+                    close_trade(tr, price, "BreakEven15", dt)
+                    continue
+            holdMins= minutes_diff(tr.peakTime, dt)
+            if holdMins>= TIME_CLOSE_45_69:
+                # Time-based exits
+                close_trade(tr, price, "TimeClose16", dt)
+        else:
+            holdMins= minutes_diff(tr.peakTime, dt)
+            if holdMins>= TIME_CLOSE_70_PLUS:
+                close_trade(tr, price, "TimeClose31", dt)
 
 def close_trade(tr: Trade, price, reason, dt):
     pl = (price - tr.entry) if tr.direction == "BUY" else (tr.entry - price)
@@ -409,22 +438,22 @@ def close_trade(tr: Trade, price, reason, dt):
         extra={"sim_time": fmt_sim_time(dt)}
     )
     tr.active = False
-    state["activeTrade"] = None
+    state["activeTrades"][tr.sessionID] = None
 
 def check_sweeps(dt, price):
-    tr= state["activeTrade"]
-    if not tr or not tr.active:
-        return
-    if tr.sessionID==1:
-        sess= state["session1"]
-    else:
-        sess= state["session2"]
+    for sID, tr in state["activeTrades"].items():
+        if not tr or not tr.active:
+            continue
+        if tr.sessionID==1:
+            sess= state["session1"]
+        else:
+            sess= state["session2"]
 
-    if sess.active and sess.openPrice is not None:
-        dist= abs(price- sess.openPrice)
-        if dist>= SWEEP_CLOSE:
-            reason = f"Sweep≥{SWEEP_CLOSE} s{tr.sessionID}"
-            close_trade(tr, price, reason)
+        if sess.active and sess.openPrice is not None:
+            dist= abs(price- sess.openPrice)
+            if dist>= SWEEP_CLOSE:
+                reason = f"Sweep≥{SWEEP_CLOSE} s{tr.sessionID}"
+                close_trade(tr, price, reason)
 
 def check_outside_sessions(dt, price):
     s1_in= in_time_window(dt, *SESSION1_START, *SESSION1_END)
@@ -522,8 +551,9 @@ def run_backtest(csvPath, yrs, srcTz, dstTz, quiet=False):
                 try_open_trade(dt, price, state["session2"], 2)
             manage_trade(dt, price)
 
-    if state["activeTrade"] and state["activeTrade"].active:
-        close_trade(state["activeTrade"], state["activeTrade"].entry, "EndOfBacktest", dt)
+    for tr in state["activeTrades"].values():
+        if tr and tr.active:
+            close_trade(tr, tr.entry, "EndOfBacktest", dt)
 
 def print_summary():
     closed = state["closedTrades"]

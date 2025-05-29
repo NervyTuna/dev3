@@ -139,11 +139,12 @@ struct TradeInfo
    double   entryPrice;
    double   peakHigh;
    double   peakLow;
+   datetime peakTime;  // Added peakTime field
    datetime openTime;
-   datetime forcedCloseTime;   // if belongs to a zone with forced close
+   datetime forcedCloseTime;
    bool     active;
-   double   finalDistanceUsed; // e.g. 45,70,100,130 after retraction skip
-   bool     noCloseRules;      // if true => skip break-even & time-based
+   double   finalDistanceUsed;
+   bool     noCloseRules;
 };
 TradeInfo tradeArray[10];
 
@@ -667,64 +668,55 @@ int CheckRetractionRange(double r)
 // ---------------------------------------------------------------------------
 bool PlaceTradeWithRetry(int cmd, double lots, int sessionNum, double finalDist, datetime forcedCloseTime, bool noCloseRules)
 {
-   int attempts=0;
-   double price = (cmd==OP_BUY)?
-                  GlobalVariableGet(globalVarPrefix+"_AdjAsk"):
-                  GlobalVariableGet(globalVarPrefix+"_AdjBid");
-   if(price<=0) return false;
+   int attempts = 0;
+   double price = (cmd == OP_BUY) ? GlobalVariableGet(globalVarPrefix + "_AdjAsk") : GlobalVariableGet(globalVarPrefix + "_AdjBid");
+   if (price <= 0) return false;
 
-   // 40-point SL => 40*IDX*Point
    double slDistPoints = StopLossPoints * IDX * Point;
-   double slPrice = (cmd==OP_BUY)? (price - slDistPoints) : (price + slDistPoints);
+   double slPrice = (cmd == OP_BUY) ? (price - slDistPoints) : (price + slDistPoints);
    slPrice = NormalizeDouble(slPrice, _Digits);
 
-   // Broker STOPLEVEL check
-   double stopLevelPoints = MarketInfo(SymbolToTrade, MODE_STOPLEVEL)*Point;
-   if(slDistPoints < stopLevelPoints)
+   double stopLevelPoints = MarketInfo(SymbolToTrade, MODE_STOPLEVEL) * Point;
+   if (slDistPoints < stopLevelPoints)
    {
       Print("[TradeOpen] StopLoss < broker STOPLEVEL => cannot open trade.");
       return false;
    }
 
-   int ticket=-1;
-   for(attempts=0; attempts<5; attempts++)
+   int ticket = -1;
+   for (attempts = 0; attempts < 5; attempts++)
    {
       RefreshRates();
-      double usedPrice= (cmd==OP_BUY)? SymbolInfoDouble(SymbolToTrade,SYMBOL_ASK)
-                                    : SymbolInfoDouble(SymbolToTrade,SYMBOL_BID);
-      if(usedPrice<=0)
+      double usedPrice = (cmd == OP_BUY) ? SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK) : SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+      if (usedPrice <= 0)
       {
          Sleep(200);
          continue;
       }
-      usedPrice= NormalizeDouble(usedPrice, _Digits);
+      usedPrice = NormalizeDouble(usedPrice, _Digits);
 
       ticket = OrderSend(SymbolToTrade, cmd, lots, usedPrice, SlippagePoints,
-                         (cmd==OP_BUY)? (usedPrice - slDistPoints):(usedPrice + slDistPoints),
-                         0,  // no TP
-                         "GER30EA", MagicNumber, 0, clrBlue);
-      if(ticket>0)
+                         (cmd == OP_BUY) ? (usedPrice - slDistPoints) : (usedPrice + slDistPoints),
+                         0, "GER30EA", MagicNumber, 0, clrBlue);
+      if (ticket > 0)
       {
-         Print("[TradeOpen] success #",attempts+1,
-               " ticket=", ticket,", lots=",lots,
-               ", SL=", DoubleToString(slPrice,_Digits),
-               ", finalDist=", finalDist,
-               ", noCloseRules=", noCloseRules);
-         // store
-         for(int i=0; i<ArraySize(tradeArray); i++)
+         Print("[TradeOpen] success #", attempts + 1, " ticket=", ticket, ", lots=", lots,
+               ", SL=", DoubleToString(slPrice, _Digits), ", finalDist=", finalDist, ", noCloseRules=", noCloseRules);
+         for (int i = 0; i < ArraySize(tradeArray); i++)
          {
-            if(!tradeArray[i].active)
+            if (!tradeArray[i].active)
             {
-               tradeArray[i].ticket          = ticket;
-               tradeArray[i].sessionNumber   = sessionNum;
-               tradeArray[i].entryPrice      = usedPrice;
-               tradeArray[i].peakHigh        = usedPrice;
-               tradeArray[i].peakLow         = usedPrice;
-               tradeArray[i].openTime        = TimeCurrent();
+               tradeArray[i].ticket = ticket;
+               tradeArray[i].sessionNumber = sessionNum;
+               tradeArray[i].entryPrice = usedPrice;
+               tradeArray[i].peakHigh = usedPrice;
+               tradeArray[i].peakLow = usedPrice;
+               tradeArray[i].peakTime = TimeCurrent();  // Initialize peakTime
+               tradeArray[i].openTime = TimeCurrent();
                tradeArray[i].forcedCloseTime = forcedCloseTime;
-               tradeArray[i].active          = true;
+               tradeArray[i].active = true;
                tradeArray[i].finalDistanceUsed = finalDist;
-               tradeArray[i].noCloseRules      = noCloseRules;
+               tradeArray[i].noCloseRules = noCloseRules;
                break;
             }
          }
@@ -732,7 +724,7 @@ bool PlaceTradeWithRetry(int cmd, double lots, int sessionNum, double finalDist,
       }
       else
       {
-         Print("[TradeOpen] fail #",attempts+1,", err=", GetLastError());
+         Print("[TradeOpen] fail #", attempts + 1, ", err=", GetLastError());
          Sleep(500);
       }
    }
@@ -769,91 +761,84 @@ int GetOpenTradeCountForSession(int sessNum)
 // ---------------------------------------------------------------------------
 void ManageOpenTrades()
 {
-   datetime nowT= TimeCurrent();
-   for(int i=0; i<ArraySize(tradeArray); i++)
+   datetime nowT = TimeCurrent();
+   for (int i = 0; i < ArraySize(tradeArray); i++)
    {
-      if(!tradeArray[i].active) continue;
+      if (!tradeArray[i].active) continue;
 
       int tk = tradeArray[i].ticket;
-      if(!OrderSelect(tk, SELECT_BY_TICKET, MODE_TRADES))
+      if (!OrderSelect(tk, SELECT_BY_TICKET, MODE_TRADES))
       {
-         // closed externally
-         tradeArray[i].active=false;
+         tradeArray[i].active = false;
          continue;
       }
 
-      // forced close
-      if(nowT >= tradeArray[i].forcedCloseTime)
+      if (nowT >= tradeArray[i].forcedCloseTime)
       {
          CloseTradeWithRetry(tk);
-         tradeArray[i].active=false;
+         tradeArray[i].active = false;
          continue;
       }
 
-      // If zone says noCloseRules => skip break-even/time
-      if(tradeArray[i].noCloseRules) 
-         continue; // only forcedClose or SL
+      if (tradeArray[i].noCloseRules) continue;
 
-      // else do normal break-even/time logic
-      double cp= (OrderType()==OP_BUY)? SymbolInfoDouble(SymbolToTrade, SYMBOL_BID)
-                                      : SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-      if(cp>0)
+      double cp = (OrderType() == OP_BUY) ? SymbolInfoDouble(SymbolToTrade, SYMBOL_BID) : SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
+      if (cp > 0)
       {
-         // update peaks
-         if(OrderType()==OP_BUY)
+         if (OrderType() == OP_BUY)
          {
-            if(cp> tradeArray[i].peakHigh) tradeArray[i].peakHigh= cp;
-            if(cp< tradeArray[i].peakLow ) tradeArray[i].peakLow = cp;
+            if (cp > tradeArray[i].peakHigh)
+            {
+               tradeArray[i].peakHigh = cp;
+               tradeArray[i].peakTime = nowT;  // Update peakTime
+            }
+            if (cp < tradeArray[i].peakLow) tradeArray[i].peakLow = cp;
          }
          else
          {
-            if(cp< tradeArray[i].peakLow ) tradeArray[i].peakLow = cp;
-            if(cp> tradeArray[i].peakHigh) tradeArray[i].peakHigh= cp;
+            if (cp < tradeArray[i].peakLow)
+            {
+               tradeArray[i].peakLow = cp;
+               tradeArray[i].peakTime = nowT;  // Update peakTime
+            }
+            if (cp > tradeArray[i].peakHigh) tradeArray[i].peakHigh = cp;
          }
       }
 
-      int holdMins = (int)((nowT - tradeArray[i].openTime)/60);
-      double usedDist = tradeArray[i].finalDistanceUsed; 
+      int holdMins = (int)((nowT - tradeArray[i].peakTime) / 60);  // Use peakTime for hold duration
+      double usedDist = tradeArray[i].finalDistanceUsed;
 
-      // If 45..69.9 => 15 adverse => break-even, else close on 16th minute
-      if(usedDist>=45 && usedDist<70)
+      if (usedDist >= 45 && usedDist < 70)
       {
-         double openP= OrderOpenPrice();
-         double adv=0;
-         if(OrderType()==OP_BUY)
-            adv = (openP - cp)*IDX/Point;
-         else
-            adv = (cp - openP)*IDX/Point;
+         double openP = OrderOpenPrice();
+         double adv = (OrderType() == OP_BUY) ? (openP - cp) * IDX / Point : (cp - openP) * IDX / Point;
 
-         if(adv>=15)
+         if (adv >= 15)
          {
-            // if we came back to ~1 pt from open => close at 0
-            double diff = MathAbs(cp - openP)*IDX/Point;
-            if(diff<1.0)
+            double diff = MathAbs(cp - openP) * IDX / Point;
+            if (diff < 1.0)
             {
-               Print("[BreakEvenClose] #", tk," => 15 adverse & returned => close@0");
+               Print("[BreakEvenClose] #", tk, " => 15 adverse & returned => close@0");
                CloseTradeWithRetry(tk);
-               tradeArray[i].active=false;
+               tradeArray[i].active = false;
                continue;
             }
          }
-         // 16th min close
-         if(holdMins>=16)
+         if (holdMins >= 16)
          {
-            Print("[TimeClose16] #", tk,", hold=",holdMins," => close");
+            Print("[TimeClose16] #", tk, ", hold=", holdMins, " => close");
             CloseTradeWithRetry(tk);
-            tradeArray[i].active=false;
+            tradeArray[i].active = false;
             continue;
          }
       }
-      else if(usedDist>=70 && usedDist<=159.9)
+      else if (usedDist >= 70 && usedDist <= 159.9)
       {
-         // 31st minute close
-         if(holdMins>=31)
+         if (holdMins >= 31)
          {
-            Print("[TimeClose31] #", tk,", hold=", holdMins, " => close");
+            Print("[TimeClose31] #", tk, ", hold=", holdMins, " => close");
             CloseTradeWithRetry(tk);
-            tradeArray[i].active=false;
+            tradeArray[i].active = false;
             continue;
          }
       }
