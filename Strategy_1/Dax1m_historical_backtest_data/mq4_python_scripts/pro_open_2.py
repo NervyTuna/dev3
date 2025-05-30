@@ -387,6 +387,19 @@ void OnTick()
       if(s2.isActive) UpdateHighLow(s2, adjBid);
    }
 
+   double bidLow  = GlobalVariableGet(globalVarPrefix + "_AdjBidLow");
+   double bidHigh = GlobalVariableGet(globalVarPrefix + "_AdjBidHigh");
+
+   if (bidLow > 0) {
+       UpdateHighLow(s1, bidLow);  // Update session 1 with bidLow
+       UpdateHighLow(s2, bidLow);  // Update session 2 with bidLow
+   }
+
+   if (bidHigh > 0) {
+       UpdateHighLow(s1, bidHigh);  // Update session 1 with bidHigh
+       UpdateHighLow(s2, bidHigh);  // Update session 2 with bidHigh
+   }
+
    // 4) Attempt to place new trade for session1
    if(s1.isActive && session1Allowed && !blockSession1 && !skipTomorrowSession1)
       CheckZonesAndMaybeOpen(s1, session1Zones, ArraySize(session1Zones), 1);

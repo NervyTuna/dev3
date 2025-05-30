@@ -538,16 +538,17 @@ def run_backtest(csvPath, yrs, srcTz, dstTz, quiet=False):
             handle_daily_reset(dt)
 
             # Continue with existing logic
-            handle_session(dt, price, state["session1"], 1)
-            handle_session(dt, price, state["session2"], 2)
-            check_volatility(dt, price)
-            check_sweeps(dt, price)
-            check_outside_sessions(dt, price)
-            if state["session1"].active:
-                try_open_trade(dt, price, state["session1"], 1)
-            if state["session2"].active:
-                try_open_trade(dt, price, state["session2"], 2)
-            manage_trade(dt, price)
+            for price in [lo, hi]:  # Check low first (for SL), then high (for TP)
+                handle_session(dt, price, state["session1"], 1)
+                handle_session(dt, price, state["session2"], 2)
+                check_volatility(dt, price)
+                check_sweeps(dt, price)
+                check_outside_sessions(dt, price)
+                if state["session1"].active:
+                    try_open_trade(dt, price, state["session1"], 1)
+                if state["session2"].active:
+                    try_open_trade(dt, price, state["session2"], 2)
+                manage_trade(dt, price)
 
     for tr in state["activeTrades"].values():  # Iterate over activeTrades
         if tr and tr.active:
