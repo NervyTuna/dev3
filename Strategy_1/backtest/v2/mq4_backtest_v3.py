@@ -632,45 +632,51 @@ def check_volatility(dt, price, sid):
 def run_backtest(csv_file, yrs, src_tz, dst_tz, produce_excel=False, out_dir="."):
     init_strategy_states()
 
-    tzSrc= ZoneInfo(src_tz)
-    tzDst= ZoneInfo(dst_tz)
+    tzSrc = ZoneInfo(src_tz)
+    tzDst = ZoneInfo(dst_tz)
 
-    f= pathlib.Path(csv_file)
+    f = pathlib.Path(csv_file)
     if not f.is_file():
         logging.error(f"CSV file not found: {csv_file}")
         return
 
     with f.open("r", newline="") as fh:
-        rdr= csv.reader(fh, delimiter=';')
-        naive= None
+        rdr = csv.reader(fh, delimiter=';')
+        naive = None
         for row in rdr:
-            if len(row)<6: continue
-            dstr= row[0].strip()
-            tstr= row[1].strip()
-            dtRaw= f"{dstr} {tstr}"
+            if len(row) < 6:
+                continue
+            dstr = row[0].strip()
+            tstr = row[1].strip()
+            dtRaw = f"{dstr} {tstr}"
             try:
-                naive= datetime.strptime(dtRaw, "%d/%m/%Y %H:%M:%S")
+                naive = datetime.strptime(dtRaw, "%d/%m/%Y %H:%M:%S")
             except:
                 continue
 
-            dtSrc= naive.replace(tzinfo=tzSrc)
-            dt= dtSrc.astimezone(tzDst)
+            dtSrc = naive.replace(tzinfo=tzSrc)
+            dt = dtSrc.astimezone(tzDst)
             if dt.year not in yrs:
                 continue
 
             try:
-                op= float(row[2])
-                hi= float(row[3])
-                lo= float(row[4])
-                cl= float(row[5])
+                op = float(row[2])
+                hi = float(row[3])
+                lo = float(row[4])
+                cl = float(row[5])
             except:
                 continue
 
-            for sid in (1,2,3,4):
+            for sid in (1, 2, 3, 4):
                 daily_reset_if_new_date(dt, sid)
+                # Handle specific times for session management
+                if dt.hour == 8 and dt.minute == 0:
+                    handle_session(dt, op, sid, 1)
+                if dt.hour == 14 and dt.minute == 30:
+                    handle_session(dt, op, sid, 2)
 
             for p in [lo, hi]:
-                for sid in (1,2,3,4):
+                for sid in (1, 2, 3, 4):
                     handle_session(dt, p, sid, 1)
                     handle_session(dt, p, sid, 2)
                     check_volatility(dt, p, sid)
@@ -684,15 +690,14 @@ def run_backtest(csv_file, yrs, src_tz, dst_tz, produce_excel=False, out_dir="."
                     manage_trade(dt, p, sid, 2)
 
         if naive:
-            last_dt= naive.replace(tzinfo=tzSrc).astimezone(tzDst)
-            for sid in (1,2,3,4):
-                st= STRAT_STATE[sid]
-                for sID,tr in st["activeTrades"].items():
+            last_dt = naive.replace(tzinfo=tzSrc).astimezone(tzDst)
+            for sid in (1, 2, 3, 4):
+                st = STRAT_STATE[sid]
+                for sID, tr in st["activeTrades"].items():
                     if tr and tr.active:
                         close_trade(tr, tr.entry, "EndOfBacktest", last_dt)
 
     produce_summaries_and_excel_single_sheet(yrs, out_dir, produce_excel)
-
 # -------------------------------------------------------------------------
 def median(lst):
     if not lst:
