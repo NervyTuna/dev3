@@ -1,0 +1,141 @@
+
+
+python mq4_backtest_v2.py --csv "C:\Users\stuar\OneDrive\Documents\Working\Trading\manual_testing\backtesting\dax-1m.csv" --year_range 2000-2025 --src_tz America/Chicago --dst_tz Europe/London --excel --verbose
+python mq4_backtest_v2.py --csv "C:\Users\stuar\OneDrive\Documents\Working\Trading\manual_testing\backtesting\dax-1m.csv" --year_range 2024 --src_tz America/Chicago --dst_tz Europe/London --excel --verbose
+
+
+Session1
+Session2
+Zone1
+Zone2
+Zone3
+Zone4
+Dist45_69
+Dist70_99
+Dist100_plus = 0 results/trades but i know has many trades at this level also level should be 100-129.9 and the 130+ not 100+. This bug shows up in several areas of the report.
+
+1st summary table has columns:
+Strategy
+Year
+Month	
+Trades	
+pips	
+hc_50 (is this profit or loss? should be profit)	
+hc_60 (should be profit)	
+hc_70 (should be profit)	
+hc_80 (should be profit)	
+hc_90 (should be profit)	
+hc_100 (should be profit)	
+peakProfit	
+peakDrawdown	
+reason	
+openTime	c
+loseTime
+
+This 1st table needs totals for every year and every strategy included so information can be digested (approx. 30k rows too much for me to make sense of) eg i need to see No15BE_AfterEarliestZone for 2024 totals etc. Would be easier if all subtotals also put into separate table below.
+
+Explain how the following metrics are calculated:
+AvgDrawdown	
+MaxDrawdown	
+AvgPeakProfit	
+MaxPeakProfit	
+AvgPipsAll	
+MedPipsAll	
+AvgWinsOnly	
+MedWinsOnly	
+AvgLossOnly	
+MedLossOnly	
+AvgHC_50	
+MedHC_50	
+AvgHC_60	
+MedHC_60	
+AvgHC_70	
+MedHC_70	
+AvgHC_80	
+MedHC_80	
+AvgHC_90	
+MedHC_90	
+AvgHC_100	
+MedHC_100
+
+
+Needs new logic for profit taking.  If 16 or mins have passed since the session low/high close at 32 points from the peak high low if this movement has not been exceeded. If has moved between 32 and 35 points close start 16th minute If has already moved more than 35 points leave open and use usual closing rules.
+
+3. Explanation of the “Advanced” Metrics
+You listed many columns in your (2) TotalsByStrategy or (3) TotalsByMonth. Here’s how they are typically computed:
+
+AvgDrawdown
+
+For each trade, you record a “peak drawdown pips” (the greatest adverse move from entry).
+
+Then over N trades, AvgDrawdown is the average of those drawdown amounts. i.e. sum(peakDrawdownPips of each trade) / N.
+
+MaxDrawdown
+
+The single largest drawdown out of all trades in that category. i.e. max(peakDrawdownPips) across those trades.
+
+AvgPeakProfit
+
+For each trade, you recorded “peakProfitPips” (the largest favorable move from entry before close).
+
+AvgPeakProfit = sum(peakProfitPips for those trades) / count.
+
+MaxPeakProfit
+
+The single biggest favorable move among those trades. i.e. max(peakProfitPips) across them.
+
+AvgPipsAll
+
+The average final pips result across all trades (wins + losses). Typically sum(all final pips)/ N.
+
+MedPipsAll (“Median Pips All”)
+
+Sort all final pips from smallest to largest. The median is the “middle” value. If N is odd, it’s the exact middle. If even, it’s the average of the two middle values.
+
+AvgWinsOnly / MedWinsOnly
+
+For just the trades with pips>0, compute average or median. Similarly for losses.
+
+So AvgWinsOnly = sum(all positive pips)/count(positive).
+
+MedWinsOnly is the median of that subset.
+
+AvgLossOnly / MedLossOnly
+
+The same logic as wins, but for pips <= 0.
+
+AvgHC_50 / MedHC_50 (and so on for 60,70,80,90,100)
+
+“HC_50” means “If we had forcibly closed the trade once it reached +50 pips of profit.”
+
+In your script, you computed for each trade a “hypothetical final pips if we forced a close at +50.” That’s what hc_50_list contains.
+
+Then AvgHC_50 is the average of that hypothetical outcome across all trades. MedHC_50 is the median.
+
+Similarly for AvgHC_60, AvgHC_70, etc.
+
+Important: The “hard close” values (hc_50, etc.) are typically the profit if the trade’s peak was ≥ that level. If a trade’s peak was only +32, then hc_50 is the real final result (maybe negative). So hc_50 is the hypothetical “close at +50 if we can, else normal result.”
+
+4. New Profit‐Taking Logic
+You said:
+
+If 16 or more minutes have passed since the session low/high, close at 32 points from the peak high/low if this movement has not been exceeded. If the move was 32–35 points, close at the 16th minute. If already moved more than 35 points, continue usual closing rules.
+
+This is more intricate. Essentially you’re introducing a “partial” or “mid-level” close at +32 if 16 minutes pass without further progress beyond 35. The logic might look something like this:
+
+Whenever you update tr.peakHigh or tr.peakLow, note the time. That’s tr.peakTime.
+
+On each new tick:
+
+elapsed = minutes_diff(tr.peakTime, dt)
+
+If elapsed >=16, check how far from your peak (peakProfit so far).
+
+If your peakProfit is between 32.0 and 35.0 (and hasn’t exceeded 35.0 yet), close now at +32.
+
+i.e. forcibly set price = tr.entry + 32 for a BUY or price = tr.entry - 32 for a SELL (or do a “virtual close” at +32 pips).
+
+If your peakProfit never even reached 32, you do your normal logic (like break-even or GSL, etc.)
+
+If your peakProfit is already > 35, keep going with the usual rules.
+

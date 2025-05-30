@@ -420,12 +420,15 @@ def manage_trade(dt, price, sid, sessNum):
                 skipBreakEven= True
 
         if not skipBreakEven:
-            adv= (tr.entry- price) if tr.direction=="BUY" else (price- tr.entry)
-            if adv>=15:
-                diff= abs(price- tr.entry)
-                if diff<1.0:
-                    close_trade(tr, price, "BreakEven15", dt)
-                    return
+            # NEW: check *adverse* excursion (-15) and recovery to ~0
+            if tr.direction == "BUY":
+                mae = tr.entry - tr.peakLow  # maximum adverse excursion
+            else:
+                mae = tr.peakHigh - tr.entry
+
+            if mae >= 15 and abs(price - tr.entry) < 1.0:
+                close_trade(tr, price, "BreakEven-15", dt)
+                return
 
         holdMins= minutes_diff(tr.peakTime, dt)
         if holdMins>= TIME_CLOSE_45_69:
@@ -593,9 +596,11 @@ def run_backtest(csv_file, yrs, src_tz, dst_tz, produce_excel=False, out_dir="."
 def produce_summaries_and_excel_single_sheet(yrs, out_dir, produce_excel):
     """
     Creates a single Excel sheet "Summary" with 3 sections:
-      1) List All Trades  (Strategy,Year,Month,Trades,NetPips,...CumePipsYear) + TOT row
-      2) Totals By Strategy (one row per strategy for multi-year) + TOT row
-      3) Totals By Month (one row per strategy&month across all years) + TOT row
+      (1) List All Trades with Cume Pips per (sid, year)
+      (2) Totals By Strategy (all years combined)
+      (3) Totals By Month (all years combined)
+
+    Each section ends with a bold totals row for each strategy.
     """
     if not produce_excel:
         logging.info("Excel not requested. Skipping summary sheets.")
@@ -607,195 +612,225 @@ def produce_summaries_and_excel_single_sheet(yrs, out_dir, produce_excel):
     import openpyxl
     from openpyxl.styles import Font
 
-    # Gather data keys
-    all_keys= list(data.keys())  # (sid,year,month)
+    # If we have no trades, nothing to do
+    all_keys = list(data.keys())  # (sid, year, month)
     if not all_keys:
-        logging.info("No trades => no excel.")
+        logging.info("No trades => no Excel output.")
         return
-    sids_in= sorted(set(k[0] for k in all_keys))
-    yrs_in= sorted(set(k[1] for k in all_keys))
-    multi_year_str= f"{min(yrs_in)}-{max(yrs_in)}"
 
-    wb= openpyxl.Workbook()
-    ws= wb.active
-    ws.title= "Summary"
+    # Gather sets
+    sids_in = sorted(set(k[0] for k in all_keys))
+    yrs_in  = sorted(set(k[1] for k in all_keys))
+    multi_year_str = f"{min(yrs_in)}-{max(yrs_in)}"
+    date_tag = datetime.now().strftime("%Y%m%d")
 
-    row=1
+    # Create workbook & primary sheet
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Summary"
 
-    # 1) List All Trades
-    ws.cell(row=row, column=1, value="List All Trades")
-    row+=1
+    # -----------------------------------------------------------
+    # SECTION 1: List All Trades
+    # -----------------------------------------------------------
+    row = 1
+    ws.cell(row=row, column=1, value="(1) List All Trades")
+    row += 1
 
-    headers_1= [
-        "Strategy","Year","Month","Trades","NetPips","Wins","Loses","WinRate","CumePipsYear"
+    headers_1 = [
+        "Strategy",
+        "Year",
+        "Month",
+        "Trades",
+        "NetPips",
+        "Wins",
+        "Loses",
+        "WinRate",
+        "CumePipsYear"
     ]
-    for col_i,h in enumerate(headers_1,1):
-        ws.cell(row=row, column=col_i, value=h).font= Font(bold=True)
-    row+=1
+    for col_i, hdr in enumerate(headers_1, start=1):
+        ws.cell(row=row, column=col_i, value=hdr).font = Font(bold=True)
+    row += 1
 
-    from collections import defaultdict
-    cume_1= defaultdict(float)
+    # We track (sid,year)-> cume pips, so we can fill the "CumePipsYear" column
+    cume_year_dict = defaultdict(float)
+    # Also track totals to produce a bold line for each strategy at the end
+    totals_1 = defaultdict(lambda: {"count": 0, "pips": 0.0, "wins": 0, "loses": 0})
+
     all_keys.sort()  # sort by (sid,year,month)
-    totalTradesSec1=0
-    totalPipsSec1= 0.0
-    totalWinsSec1= 0
-    totalLoseSec1= 0
+    for (sid, yy, mm) in all_keys:
+        st_ = data[(sid, yy, mm)]
+        c   = st_["count"]
+        p   = st_["pips"]
+        w   = st_["wins"]
+        l   = st_["loses"]
+        wr  = (w / c * 100) if c > 0 else 0
 
-    for (sid,yy,mm) in all_keys:
-        st_= data[(sid,yy,mm)]
-        c= st_["count"]
-        p= st_["pips"]
-        w= st_["wins"]
-        l= st_["loses"]
-        wr= (w/c*100) if c>0 else 0
-        cume_1[(sid,yy)] += p
-
-        totalTradesSec1+= c
-        totalPipsSec1  += p
-        totalWinsSec1  += w
-        totalLoseSec1  += l
+        # accumulate
+        cume_year_dict[(sid, yy)] += p
+        totals_1[sid]["count"] += c
+        totals_1[sid]["pips"]  += p
+        totals_1[sid]["wins"]  += w
+        totals_1[sid]["loses"] += l
 
         ws.cell(row=row, column=1, value=STRATEGY_NAMES[sid])
         ws.cell(row=row, column=2, value=yy)
         ws.cell(row=row, column=3, value=mm)
         ws.cell(row=row, column=4, value=c)
-        ws.cell(row=row, column=5, value=round(p,1))
+        ws.cell(row=row, column=5, value=round(p, 1))
         ws.cell(row=row, column=6, value=w)
         ws.cell(row=row, column=7, value=l)
-        ws.cell(row=row, column=8, value=round(wr,1))
-        ws.cell(row=row, column=9, value=round(cume_1[(sid,yy)],1))
-        row+=1
+        ws.cell(row=row, column=8, value=round(wr, 1))
+        ws.cell(row=row, column=9, value=round(cume_year_dict[(sid, yy)], 1))
+        row += 1
 
-    # TOT row
-    wrSec1= (totalWinsSec1/ totalTradesSec1*100) if totalTradesSec1>0 else 0
-    ws.cell(row=row, column=1, value="TOTALS").font= Font(bold=True)
-    ws.cell(row=row, column=4, value=totalTradesSec1).font= Font(bold=True)
-    ws.cell(row=row, column=5, value=round(totalPipsSec1,1)).font= Font(bold=True)
-    ws.cell(row=row, column=6, value=totalWinsSec1).font= Font(bold=True)
-    ws.cell(row=row, column=7, value=totalLoseSec1).font= Font(bold=True)
-    ws.cell(row=row, column=8, value=round(wrSec1,1)).font= Font(bold=True)
-    row+=2
+    # Bold totals row for each strategy in section 1
+    for sid in sorted(totals_1.keys()):
+        t = totals_1[sid]
+        c_ = t["count"]
+        p_ = t["pips"]
+        w_ = t["wins"]
+        l_ = t["loses"]
+        wr_ = (w_ / c_ * 100) if c_ > 0 else 0
+        ws.cell(row=row, column=1, value=f"{STRATEGY_NAMES[sid]} Totals").font = Font(bold=True)
+        ws.cell(row=row, column=4, value=c_).font = Font(bold=True)
+        ws.cell(row=row, column=5, value=round(p_, 1)).font = Font(bold=True)
+        ws.cell(row=row, column=6, value=w_).font = Font(bold=True)
+        ws.cell(row=row, column=7, value=l_).font = Font(bold=True)
+        ws.cell(row=row, column=8, value=round(wr_, 1)).font = Font(bold=True)
+        row += 1
 
-    # 2) TotalsByStrategy
-    ws.cell(row=row, column=1, value="Totals By Strategy")
-    row+=1
+    row += 2  # blank line
 
-    headers_2= [
-        "Strategy","Year","Trades","NetPips","Wins","Loses","WinRate","CumePipsAllYears"
+    # -----------------------------------------------------------
+    # SECTION 2: Totals By Strategy (multi-year)
+    # -----------------------------------------------------------
+    ws.cell(row=row, column=1, value="(2) Totals By Strategy")
+    row += 1
+
+    headers_2 = [
+        "Strategy",
+        "YearRange",
+        "Trades",
+        "NetPips",
+        "Wins",
+        "Loses",
+        "WinRate",
+        "CumePipsAllYears"
     ]
-    for col_i,h in enumerate(headers_2,1):
-        ws.cell(row=row, column=col_i, value=h).font= Font(bold=True)
-    row+=1
+    for col_i, hdr in enumerate(headers_2, start=1):
+        ws.cell(row=row, column=col_i, value=hdr).font = Font(bold=True)
+    row += 1
 
-    stratTotals= defaultdict(lambda: {"count":0,"pips":0.0,"wins":0,"loses":0})
-    for (sid_,y_,m_) in all_keys:
-        st_= data[(sid_,y_,m_)]
-        stratTotals[sid_]["count"] += st_["count"]
-        stratTotals[sid_]["pips"]  += st_["pips"]
-        stratTotals[sid_]["wins"]  += st_["wins"]
-        stratTotals[sid_]["loses"] += st_["loses"]
-
-    totCountS2=0
-    totPipsS2=0.0
-    totWinsS2=0
-    totLoseS2=0
-
-    for sid in sorted(stratTotals.keys()):
-        d= stratTotals[sid]
-        c= d["count"]
-        p= d["pips"]
-        w= d["wins"]
-        l= d["loses"]
-        wr= (w/c*100) if c>0 else 0
-
-        totCountS2+= c
-        totPipsS2 += p
-        totWinsS2 += w
-        totLoseS2 += l
+    # We'll sum everything for each strategy across all years
+    for sid in sorted(sids_in):
+        sumCount = 0
+        sumPips  = 0.0
+        sumWins  = 0
+        sumLoses = 0
+        for (s2, y2, m2) in data.keys():
+            if s2 == sid:
+                st2 = data[(s2, y2, m2)]
+                sumCount += st2["count"]
+                sumPips  += st2["pips"]
+                sumWins  += st2["wins"]
+                sumLoses += st2["loses"]
+        wr_ = (sumWins / sumCount * 100) if sumCount > 0 else 0
 
         ws.cell(row=row, column=1, value=STRATEGY_NAMES[sid])
         ws.cell(row=row, column=2, value=multi_year_str)
-        ws.cell(row=row, column=3, value=c)
-        ws.cell(row=row, column=4, value=round(p,1))
-        ws.cell(row=row, column=5, value=w)
-        ws.cell(row=row, column=6, value=l)
-        ws.cell(row=row, column=7, value=round(wr,1))
-        ws.cell(row=row, column=8, value=round(p,1))
+        ws.cell(row=row, column=3, value=sumCount)
+        ws.cell(row=row, column=4, value=round(sumPips, 1))
+        ws.cell(row=row, column=5, value=sumWins)
+        ws.cell(row=row, column=6, value=sumLoses)
+        ws.cell(row=row, column=7, value=round(wr_, 1))
+        ws.cell(row=row, column=8, value=round(sumPips, 1))
+        row += 1
+
+    row += 2  # blank line
+
+    # -----------------------------------------------------------
+    # SECTION 3: Totals By Month (across all years)
+    # -----------------------------------------------------------
+    ws.cell(row=row, column=1, value="(3) Totals By Month")
+    row += 1
+
+    headers_3 = [
+        "Strategy",
+        "YearRange",
+        "Month",
+        "Trades",
+        "NetPips",
+        "Wins",
+        "Loses",
+        "WinRate",
+        "CumePipsYear"
+    ]
+    for col_i, hdr in enumerate(headers_3, start=1):
+        ws.cell(row=row, column=col_i, value=hdr).font = Font(bold=True)
+    row += 1
+
+    # We'll build a monthly aggregator: monthlyAgg[(sid,month)] = ...
+    monthlyAgg = defaultdict(lambda: {"count":0, "pips":0.0, "wins":0, "loses":0})
+    for (sid_, y_, m_) in data.keys():
+        st_ = data[(sid_, y_, m_)]
+        monthlyAgg[(sid_, m_)]["count"] += st_["count"]
+        monthlyAgg[(sid_, m_)]["pips"]  += st_["pips"]
+        monthlyAgg[(sid_, m_)]["wins"]  += st_["wins"]
+        monthlyAgg[(sid_, m_)]["loses"] += st_["loses"]
+
+    # We'll do a cume as we list months 1..12 for each strategy
+    monthlyCume= defaultdict(float)
+
+    for sid in sorted(sids_in):
+        monthlyCume[sid] = 0.0
+        for m_ in range(1, 13):
+            st2= monthlyAgg.get((sid, m_), None)
+            if not st2 or st2["count"]<=0:
+                continue
+            c_ = st2["count"]
+            p_ = st2["pips"]
+            w_ = st2["wins"]
+            l_ = st2["loses"]
+            wr_ = (w_/c_*100) if c_>0 else 0
+            monthlyCume[sid]+= p_
+
+            ws.cell(row=row, column=1, value=STRATEGY_NAMES[sid])
+            ws.cell(row=row, column=2, value=multi_year_str)
+            ws.cell(row=row, column=3, value=m_)
+            ws.cell(row=row, column=4, value=c_)
+            ws.cell(row=row, column=5, value=round(p_,1))
+            ws.cell(row=row, column=6, value=w_)
+            ws.cell(row=row, column=7, value=l_)
+            ws.cell(row=row, column=8, value=round(wr_,1))
+            ws.cell(row=row, column=9, value=round(monthlyCume[sid],1))
+            row+=1
+
+        # After listing that strategy's months, we add a bold totals row
+        stratCount = 0
+        stratPips  = 0.0
+        stratWins  = 0
+        stratLoses = 0
+        for m_ in range(1,13):
+            st3= monthlyAgg.get((sid, m_), None)
+            if st3:
+                stratCount += st3["count"]
+                stratPips  += st3["pips"]
+                stratWins  += st3["wins"]
+                stratLoses += st3["loses"]
+
+        wr_ = (stratWins/stratCount*100) if stratCount>0 else 0
+        rowBold = row
+        ws.cell(row=rowBold, column=1, value=f"{STRATEGY_NAMES[sid]} MonthTotals").font= Font(bold=True)
+        ws.cell(row=rowBold, column=4, value=stratCount).font= Font(bold=True)
+        ws.cell(row=rowBold, column=5, value=round(stratPips,1)).font= Font(bold=True)
+        ws.cell(row=rowBold, column=6, value=stratWins).font= Font(bold=True)
+        ws.cell(row=rowBold, column=7, value=stratLoses).font= Font(bold=True)
+        ws.cell(row=rowBold, column=8, value=round(wr_,1)).font= Font(bold=True)
+        ws.cell(row=rowBold, column=9, value=round(monthlyCume[sid],1)).font= Font(bold=True)
         row+=1
 
-    wrS2= (totWinsS2/totCountS2*100) if totCountS2>0 else 0
-    ws.cell(row=row, column=1, value="TOTALS").font= Font(bold=True)
-    ws.cell(row=row, column=3, value=totCountS2).font= Font(bold=True)
-    ws.cell(row=row, column=4, value=round(totPipsS2,1)).font= Font(bold=True)
-    ws.cell(row=row, column=5, value=totWinsS2).font= Font(bold=True)
-    ws.cell(row=row, column=6, value=totLoseS2).font= Font(bold=True)
-    ws.cell(row=row, column=7, value=round(wrS2,1)).font= Font(bold=True)
-    ws.cell(row=row, column=8, value=round(totPipsS2,1)).font= Font(bold=True)
-    row+=2
-
-    # 3) TotalsByMonth
-    ws.cell(row=row, column=1, value="Totals By Month")
-    row+=1
-
-    headers_3= [
-        "Strategy","Year","Month","Trades","NetPips","Wins","Loses","WinRate","CumePipsYear"
-    ]
-    for col_i,h in enumerate(headers_3,1):
-        ws.cell(row=row, column=col_i, value=h).font= Font(bold=True)
-    row+=1
-
-    monthlyAgg= defaultdict(lambda: {"count":0,"pips":0.0,"wins":0,"loses":0})
-    for (sid_,y_,m_) in all_keys:
-        st_= data[(sid_,y_,m_)]
-        monthlyAgg[(sid_,m_)]["count"] += st_["count"]
-        monthlyAgg[(sid_,m_)]["pips"]  += st_["pips"]
-        monthlyAgg[(sid_,m_)]["wins"]  += st_["wins"]
-        monthlyAgg[(sid_,m_)]["loses"] += st_["loses"]
-
-    monthlyCume= defaultdict(float)
-    totTrS3=0
-    totPipsS3= 0.0
-    totWinsS3= 0
-    totLoseS3= 0
-
-    for sid in sorted(set(k[0] for k in all_keys)):
-        monthlyCume[sid]=0.0
-        for m_ in range(1,13):
-            dd= monthlyAgg[(sid,m_)]
-            c= dd["count"]
-            if c>0:
-                p= dd["pips"]
-                w= dd["wins"]
-                l= dd["loses"]
-                wr= (w/c*100) if c>0 else 0
-
-                monthlyCume[sid]+= p
-                totTrS3+= c
-                totPipsS3+= p
-                totWinsS3+= w
-                totLoseS3+= l
-
-                ws.cell(row=row, column=1, value=STRATEGY_NAMES[sid])
-                ws.cell(row=row, column=2, value=multi_year_str)
-                ws.cell(row=row, column=3, value=m_)
-                ws.cell(row=row, column=4, value=c)
-                ws.cell(row=row, column=5, value=round(p,1))
-                ws.cell(row=row, column=6, value=w)
-                ws.cell(row=row, column=7, value=l)
-                ws.cell(row=row, column=8, value=round(wr,1))
-                ws.cell(row=row, column=9, value=round(monthlyCume[sid],1))
-                row+=1
-
-    wrS3= (totWinsS3/totTrS3*100) if totTrS3>0 else 0
-    ws.cell(row=row, column=1, value="TOTALS").font= Font(bold=True)
-    ws.cell(row=row, column=4, value=totTrS3).font= Font(bold=True)
-    ws.cell(row=row, column=5, value=round(totPipsS3,1)).font= Font(bold=True)
-    ws.cell(row=row, column=6, value=totWinsS3).font= Font(bold=True)
-    ws.cell(row=row, column=7, value=totLoseS3).font= Font(bold=True)
-    ws.cell(row=row, column=8, value=round(wrS3,1)).font= Font(bold=True)
-    ws.cell(row=row, column=9, value=round(totPipsS3,1)).font= Font(bold=True)
-
-    outp= pathlib.Path(out_dir)/"results.xlsx"
+    # Finally, save to a time-stamped file
+    outp = pathlib.Path(out_dir)/f"results_{date_tag}.xlsx"
     wb.save(outp)
     logging.info(f"Excel file saved => {outp}")
 
