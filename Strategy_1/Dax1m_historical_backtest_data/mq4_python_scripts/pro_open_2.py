@@ -1,1266 +1,1022 @@
-#!/usr/bin/env python3
-r"""
-Multi-Strategy Python simulator for GER30EA with 4 variations, logs all trades,
-and produces a single-sheet Excel with multiple sections:
+//+------------------------------------------------------------------+
+//|                                                   GER30EA.mq4    |
+//|        Full Strategy with Zone-Specific Distances & No-Close     |
+//+------------------------------------------------------------------+
+#property copyright "Your Name"
+#property link      "https://www.example.com"
+#property version   "3.0"
+#property strict
 
-(1) ListAllTrades
-(1B) Subtotals by (Strategy, Year)
-(2) TotalsByStrategy
-(3) TotalsByMonth
-(4) Year x Strategy Pivot
-(5) Major Metrics Table
-(6) Optional “Optimal Levels Analysis”
+// ---------------------------------------------------------------------------
+//                          MODULE 1: GLOBAL INPUTS & STRUCTS
+// ---------------------------------------------------------------------------
 
-Notable adjustments:
- - Removed “Total_hcXX” columns from the pivot table (section 4).
- - Distances: 70–99, 100–129, 130+ are recognized if trades actually open that far from session open.
- - We still compute “hc_50, hc_60, …” for the “Optimal Levels” (section 6).
- - Partial-close if 16+ min pass since peak and peakProfit in [32..35] => forcibly +32 pips
-"""
+// We'll default the symbol to the current chart, but you can override if needed.
+string   SymbolToTrade    = "";
 
-import csv
-import argparse
-import logging
-from datetime import datetime, time
-from zoneinfo import ZoneInfo
-import pathlib
-import re
-from collections import defaultdict, Counter
+// Magic number for trades
+input int MagicNumber     = 90001;
 
-try:
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill
-    HAVE_OPENPYXL = True
-except ImportError:
-    HAVE_OPENPYXL = False
+// Broker points vs. index points multiplier.
+// If 1 broker point = 0.1 DAX index point, set IDX=10 (so that 1 "index point" = 10 broker points).
+#define IDX 10
 
-# -------------------------------------------------------------------------
-# AGGREGATOR for final stats
-# -------------------------------------------------------------------------
-def aggregator_factory():
-    return {
-        "count": 0,
-        "wins":  0,
-        "loses": 0,
-        "pips_list": [],
-        "hc_50_list":  [],
-        "hc_60_list":  [],
-        "hc_70_list":  [],
-        "hc_80_list":  [],
-        "hc_90_list":  [],
-        "hc_100_list": [],
+// Tolerance in *index points*
+input double TolerancePoints = 9.0; // e.g. 9 => 9 * IDX = 90 broker points
 
-        "sumDD":  0.0,
-        "maxDD":  0.0,
-        "sumProfitPeak": 0.0,
-        "maxProfitPeak": 0.0,
-    }
+// StopLoss in index points (40 => 40 * IDX in broker points)
+input double StopLossPoints  = 40.0;
 
-data = defaultdict(aggregator_factory)
+// We keep a "universal" list of possible levels, to handle retraction skip
+double entryLevels[] = {45, 70, 100, 130};
 
-# For the new major metrics table (#5), we track each strategy+year’s
-# final-dist-based pips in separate lists:
-def major_metrics_factory():
-    return {
-        "session1_list": [],
-        "session2_list": [],
-        "zone1_list":    [],
-        "zone2_list":    [],
-        "zone3_list":    [],
-        "zone4_list":    [],
+// Retraction table
+// We'll implement them as 4 "bins": retraction min, retraction max, skipLevels, addPoints.
+struct RetractionRange
+{
+   double minRetract;
+   double maxRetract;
+   int    skipLevels;  // 0=just addPoints, 1=skip next level, 2=skip 2 levels, -1=cancel session
+   double addPoints;   // e.g. 18 if 15–29.9
+};
+RetractionRange retractionTable[4];
 
-        "dist45_69_list":   [],
-        "dist70_99_list":   [],
-        "dist100_129_list": [],
-        "dist130_plus_list":[]  # for finalDist >=130
-    }
+// Session times
+// Session 1: 08:00–12:30
+string Session1Start = "08:00";
+string Session1End   = "12:30";
 
-majorMetrics = defaultdict(major_metrics_factory)
+// Session 2: 14:30–17:16
+string Session2Start = "14:30";
+string Session2End   = "17:16";
 
-# diag counters
-open_dist_counter   = Counter()
-close_reason_counter= Counter()
+// Each zone has: startHHMM, endHHMM, forcedClose, sessionNum,
+//   baseDistance, noCloseRules
+struct ZoneInfo
+{
+   string   startHHMM;
+   string   endHHMM;
+   datetime forcedClose; // We'll store actual forced-close time once we parse it
+   int      sessionNum;
+   double   baseDistance;   // e.g. 45 or 70
+   bool     noCloseRules;   // if true => skip break-even/time-based
+};
+ZoneInfo session1Zones[];
+ZoneInfo session2Zones[];
 
-# -------------------------------------------------------------------------
-# Common strategy config
-# -------------------------------------------------------------------------
-TOLERANCE        = 9.0
-GSL              = 40.0
-SWEEP_CLOSE      = 179.0
-OVERNIGHT_LIMIT  = 200.0
-MIDDAY_LIMIT     = 150.0
-TIME_CLOSE_45_69 = 16
-TIME_CLOSE_70_PLUS = 31
+// Flags for session allowed
+bool session1Allowed = true;
+bool session2Allowed = true;
 
-RETRACTION_TABLE = [
-    (15.0, 29.9,  0, 18.0),
-    (30.0, 35.9,  1,  0.0),
-    (36.0, 45.9,  2,  0.0),
-    (46.0, 9999.0, -1, 0.0),
-]
+// If retraction≥46 and no trades open => block entire session
+bool blockSession1   = false;
+bool blockSession2   = false;
 
-DIST_LEVELS = [45, 70, 100, 130]
+// "Used" levels for each session in each zone
+// We'll store them in a 2D array [zoneIndex][0..3] if needed, or we can store used globally
+// The brief does not explicitly say we cannot reuse a level in a different zone. Usually
+// you only block re-using the same level within the same session. We'll do per-session basis.
+bool usedLevelSession1[4];
+bool usedLevelSession2[4];
 
-SESSION1_START = (8, 0)
-SESSION1_END   = (12, 30)
+// Volatility constraints
+double overnightStartPrice = 0.0; // price at 17:16
+bool   skipTomorrowSession1 = false;
 
-SESSION2_START = (14, 30)
-SESSION2_END   = (17, 16)
+double middayStartPrice     = 0.0; // price at 12:00
+bool   skipTodaySession2    = false;
 
-# ---------------------------------------------------------------------------
-#  ACTIVE-TRADING ZONES  (no overlaps, IDs 1-4 preserved)
-# ---------------------------------------------------------------------------
+// We'll do a once-per-minute OnTimer check for sweeps & volatility
+datetime lastSweepCheck     = 0;
 
-SESSION1_ZONES = [
-    # id  window-start     window-end       forced-close  base  noClose
-    ((8,16),  (9,5),   (9,31),  1, 45, False),   # Zone-1 45 pts
-    ((9,30),  (9,45),  (10,6),  2, 45, False),   # Zone-2 45 pts
-    ((10,15), (10,30), (12,31), 3, 70, False),   # Zone-3a 70 pts  (trimmed)
-    ((10,30), (10,45), (12,31), 4, 70, False),   # Zone-3b 70 pts  (new)
-]
+// For dynamic spread handling
+bool   ForceSpread          = false;   // override if user wants
+double OverriddenSpread     = 2.0;     // forced spread value
+double DefaultSpreadPoints  = 5.0;
+int    SlippagePoints       = 3;
 
-SESSION2_ZONES = [
-    ((14,46), (15,6),  (17,16), 1, 45, False),   # Zone-1 45 pts
-    ((15,15), (15,30), (17,16), 2, 70, False),   # Zone-2a 70 pts  (trimmed)
-    ((15,30), (15,45), (17,16), 3, 70, False),   # Zone-2b 70 pts  (new)
-    ((15,45), (16,48), (17,16), 4, 45, False),   # Zone-4 45 pts
-]
+// Spread schedule
+struct SpreadTime
+{
+   string startTime;
+   string endTime;
+   double spreadPoints;
+};
+SpreadTime spreadSchedule[] =
+{
+   {"01:15","08:00", 4.0},
+   {"08:00","09:00", 2.0},
+   {"09:00","17:30", 1.2},
+   {"17:30","22:00", 2.0},
+   {"22:00","23:59", 5.0},
+   {"00:00","01:15", 5.0}
+};
 
-STRATEGY_NAMES = {
-    1: "OriginalAll",
-    2: "No15BE_EarliestZone",
-    3: "No15BE_Any45Trade",
-    4: "No15BE_AfterEarliestZone",
+// We'll track adjusted bid/ask in global variables
+string globalVarPrefix;
+
+// For money management: bet size = equity/800
+double BetDivisor = 800.0;
+
+// We'll store session data for open, high, low
+struct SessionData
+{
+   datetime startTime;
+   datetime endTime;
+   double   openPrice;
+   double   highPrice;
+   double   lowPrice;
+   bool     isActive;
+};
+SessionData s1;
+SessionData s2;
+
+// We'll track trades in an array for logging
+struct TradeInfo
+{
+   int      ticket;
+   int      sessionNumber;
+   double   entryPrice;
+   double   peakHigh;
+   double   peakLow;
+   datetime peakTime;  // Added peakTime field
+   datetime openTime;
+   datetime forcedCloseTime;
+   bool     active;
+   double   finalDistanceUsed;
+   bool     noCloseRules;
+};
+TradeInfo tradeArray[10];
+
+// ---------------------------------------------------------------------------
+//                          MODULE 2: INITIALIZATION
+// ---------------------------------------------------------------------------
+int OnInit()
+{
+   if(SymbolToTrade=="")
+      SymbolToTrade = Symbol();
+
+   globalVarPrefix = SanitizeSymbol(SymbolToTrade) + "_SpreadVars";
+
+   // Retraction table
+   // 15–29.9 => skipLevels=0 => +18
+   // 30–35.9 => skipLevels=1
+   // 36–45.9 => skipLevels=2
+   // >=46    => skipLevels=-1 => session cancel
+   retractionTable[0].minRetract  = 15.0;
+   retractionTable[0].maxRetract  = 29.9;
+   retractionTable[0].skipLevels  = 0;
+   retractionTable[0].addPoints   = 18.0;
+
+   retractionTable[1].minRetract  = 30.0;
+   retractionTable[1].maxRetract  = 35.9;
+   retractionTable[1].skipLevels  = 1;
+   retractionTable[1].addPoints   = 0.0;
+
+   retractionTable[2].minRetract  = 36.0;
+   retractionTable[2].maxRetract  = 45.9;
+   retractionTable[2].skipLevels  = 2;
+   retractionTable[2].addPoints   = 0.0;
+
+   retractionTable[3].minRetract  = 46.0;
+   retractionTable[3].maxRetract  = 999999.0;
+   retractionTable[3].skipLevels  = -1;  // session cancel
+   retractionTable[3].addPoints   = 0.0;
+
+   // -----------------------------------------------------------------------
+   // Build out session 1 zones, each with a baseDistance + forcedClose + noCloseRules
+   // The brief states:
+   //   1) 08:16–09:05 => base=45 => forcedClose=09:31 => noCloseRules=TRUE
+   //   2) 09:30–09:45 => base=45 => forcedClose=10:06 => normal close rules
+   //   3) 10:15–10:45 => base=70 => forcedClose=12:31 => normal close rules
+   //   4) 10:45–11:45 => base=45 => forcedClose=12:31 => normal close rules
+   ArrayResize(session1Zones,4);
+
+   session1Zones[0].startHHMM     = "08:16";
+   session1Zones[0].endHHMM       = "09:05";
+   session1Zones[0].forcedClose   = 0; // fill later
+   session1Zones[0].sessionNum    = 1;
+   session1Zones[0].baseDistance  = 45;
+   session1Zones[0].noCloseRules  = true; // special early zone
+
+   session1Zones[1].startHHMM     = "09:30";
+   session1Zones[1].endHHMM       = "09:45";
+   session1Zones[1].forcedClose   = 0;
+   session1Zones[1].sessionNum    = 1;
+   session1Zones[1].baseDistance  = 45;
+   session1Zones[1].noCloseRules  = false;
+
+   session1Zones[2].startHHMM     = "10:15";
+   session1Zones[2].endHHMM       = "10:45";
+   session1Zones[2].forcedClose   = 0;
+   session1Zones[2].sessionNum    = 1;
+   session1Zones[2].baseDistance  = 70;
+   session1Zones[2].noCloseRules  = false;
+
+   session1Zones[3].startHHMM     = "10:45";
+   session1Zones[3].endHHMM       = "11:45";
+   session1Zones[3].forcedClose   = 0;
+   session1Zones[3].sessionNum    = 1;
+   session1Zones[3].baseDistance  = 45;
+   session1Zones[3].noCloseRules  = false;
+
+   // -----------------------------------------------------------------------
+   // Session 2 zones:
+   //   1) 14:46–15:06 => base=45 => forcedClose=17:16 => normal
+   //   2) 15:15–15:45 => base=70 => forcedClose=17:16 => normal
+   //   3) 15:45–16:48 => base=45 => forcedClose=17:16 => normal
+   ArrayResize(session2Zones,3);
+
+   session2Zones[0].startHHMM     = "14:46";
+   session2Zones[0].endHHMM       = "15:06";
+   session2Zones[0].forcedClose   = 0;
+   session2Zones[0].sessionNum    = 2;
+   session2Zones[0].baseDistance  = 45;
+   session2Zones[0].noCloseRules  = false;
+
+   session2Zones[1].startHHMM     = "15:15";
+   session2Zones[1].endHHMM       = "15:45";
+   session2Zones[1].forcedClose   = 0;
+   session2Zones[1].sessionNum    = 2;
+   session2Zones[1].baseDistance  = 70;
+   session2Zones[1].noCloseRules  = false;
+
+   session2Zones[2].startHHMM     = "15:45";
+   session2Zones[2].endHHMM       = "16:48";
+   session2Zones[2].forcedClose   = 0;
+   session2Zones[2].sessionNum    = 2;
+   session2Zones[2].baseDistance  = 45;
+   session2Zones[2].noCloseRules  = false;
+
+   // Initialize used arrays
+   for(int i=0; i<4; i++)
+   {
+      usedLevelSession1[i] = false;
+      usedLevelSession2[i] = false;
+   }
+
+   // Setup session data
+   SetupSessions();
+
+   // Set 1-minute timer
+   EventSetTimer(60);
+
+   Print("[OnInit] Completed. Symbol=", SymbolToTrade,", Magic=",MagicNumber);
+   return(INIT_SUCCEEDED);
 }
 
-# -------------------------------------------------------------------------
-# Strategy state
-# -------------------------------------------------------------------------
-class SessionData:
-    def __init__(self, name, stH, stM, endH, endM, zones):
-        self.name      = name
-        self.startH    = stH
-        self.startM    = stM
-        self.endH      = endH
-        self.endM      = endM
-        self.active    = False
-        self.dayDate   = None
-        self.openPrice = None
-        self.highPrice = None
-        self.lowPrice  = None
-        self.allowed   = True
-        self.zones     = zones
-
-class Trade:
-    def __init__(self, strategyID, direction, entryPrice,
-                 sessionID, zoneID, forcedClose, openTime,
-                 finalDist, noCloseRules):
-        self.strategyID   = strategyID
-        self.direction    = direction
-        self.entry        = entryPrice
-        self.sessionID    = sessionID
-        self.zoneID       = zoneID
-        self.forcedClose  = forcedClose
-        self.openTime     = openTime
-        self.finalDist    = finalDist
-        self.noCloseRules = noCloseRules
-
-        self.peakHigh     = entryPrice
-        self.peakLow      = entryPrice
-        self.peakTime     = openTime
-        self.active       = True
-
-STRAT_STATE = {}
-
-def init_strategy_states():
-    for sid in (1,2,3,4):
-        s1 = SessionData("Session1", *SESSION1_START, *SESSION1_END, SESSION1_ZONES)
-        s2 = SessionData("Session2", *SESSION2_START, *SESSION2_END, SESSION2_ZONES)
-        STRAT_STATE[sid] = {
-            "session1": s1,
-            "session2": s2,
-            "activeTrades": {1: None, 2: None},
-            "closedTrades": [],
-            "overnightRef": None,
-            "middayRef": None,
-            "currentDate": None,
-        }
-
-# -------------------------------------------------------------------------
-# CLI & logging
-# -------------------------------------------------------------------------
-def parse_args():
-    ap= argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True)
-    ap.add_argument("--year_range", default="2024")
-    ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--src_tz", default="America/Chicago")
-    ap.add_argument("--dst_tz", default="Europe/London")
-    ap.add_argument("--out_dir", default=".")
-    ap.add_argument("--excel", action="store_true")
-    return ap.parse_args()
-
-def setup_logging(verbose, out_dir, yr_tag=""):
-    outp= pathlib.Path(out_dir)
-    outp.mkdir(exist_ok=True)
-    log_name= outp/ f"mq4_multi_{yr_tag}.log"
-    logging.basicConfig(
-        level=(logging.DEBUG if verbose else logging.INFO),
-        format="%(asctime)s %(levelname)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_name, mode="w", encoding="utf-8")
-        ]
-    )
-    logging.info(f"Logging to {log_name}")
-
-def parse_year_range(rng):
-    if "-" in rng:
-        s,e= rng.split("-")
-        return range(int(s), int(e)+1)
-    else:
-        y= int(rng)
-        return range(y,y+1)
-
-# -------------------------------------------------------------------------
-def minutes_diff(d1, d2):
-    return int((d2-d1).total_seconds()//60)
-
-def daily_reset_if_new_date(dt, sid):
-    st= STRAT_STATE[sid]
-    old= st["currentDate"]
-    new_ = dt.date()
-    if old is None or old!= new_:
-        st["currentDate"]= new_
-        st["session1"].allowed= True
-        st["session1"].active= False
-        st["session2"].allowed= True
-        st["session2"].active= False
-        st["session1"].dayDate= new_
-        st["session2"].dayDate= new_
-        st["activeTrades"]= {1: None, 2: None}
-        logging.debug(f"[Strategy {sid}] daily reset for {new_}")
-
-def in_time_window(dt, h1,m1, h2,m2):
-    t= dt.time()
-    st= time(h1,m1)
-    ed= time(h2,m2)
-    if ed<st:
-        return (t>=st) or (t<ed)
-    else:
-        return (t>=st) and (t<ed)
-
-def handle_session(dt, price, sid, sessNum):
-    st= STRAT_STATE[sid]
-    sess= st["session1"] if sessNum==1 else st["session2"]
-    if sess.dayDate!= dt.date() and sess.active:
-        end_session(sid, sessNum)
-
-    if not sess.allowed:
-        if sess.active:
-            end_session(sid, sessNum)
-        return
-
-    if in_time_window(dt, sess.startH, sess.startM, sess.endH, sess.endM):
-        if not sess.active:
-            start_session(sid, sessNum, price, dt)
-        else:
-            if price> sess.highPrice:
-                sess.highPrice= price
-            if price< sess.lowPrice:
-                sess.lowPrice= price
-    else:
-        if sess.active:
-            end_session(sid, sessNum)
-
-def start_session(sid, sessNum, price, dt):
-    st= STRAT_STATE[sid]
-    sess= st["session1"] if sessNum==1 else st["session2"]
-    sess.active= True
-    sess.openPrice= price
-    sess.highPrice= price
-    sess.lowPrice= price
-    logging.debug(f"[Strat{sid}] Session{sessNum} start @ {price:.1f}, date={dt.date()}")
-
-def end_session(sid, sessNum):
-    st= STRAT_STATE[sid]
-    sess= st["session1"] if sessNum==1 else st["session2"]
-    logging.debug(f"[Strat{sid}] Session{sessNum} end.")
-    sess.active= False
-    sess.openPrice= None
-    sess.highPrice= None
-    sess.lowPrice= None
-
-def get_active_zone(dt, sid, sessNum):
-    st= STRAT_STATE[sid]
-    sess= st["session1"] if sessNum==1 else st["session2"]
-    if not sess.active:
-        return None
-    for z in sess.zones:
-        (stH,stM)= z[0]
-        (enH,enM)= z[1]
-        (fcH,fcM)= z[2]
-        zID= z[3]
-        bD=  z[4]
-        nC=  z[5]
-        if in_time_window(dt, stH,stM, enH,enM):
-            forcedC= datetime(dt.year, dt.month, dt.day, fcH, fcM, tzinfo=dt.tzinfo)
-            return (forcedC, zID, bD, nC)
-    return None
-
-def calc_retraction(dt, price, sid, sessNum):
-    st= STRAT_STATE[sid]
-    sess= st["session1"] if sessNum==1 else st["session2"]
-    if not sess.active or sess.openPrice is None:
-        return 0.0
-    if price>= sess.openPrice:
-        return sess.highPrice- price
-    else:
-        return price- sess.lowPrice
-
-def retraction_lookup(r):
-    for (mn,mx, skip, shift) in RETRACTION_TABLE:
-        if mn<=r<=mx:
-            return (skip, shift)
-    return (0,0)
-
-def pick_final_distance(baseDist, skip, shift):
-    try:
-        baseIdx= DIST_LEVELS.index(baseDist)
-    except ValueError:
-        return None
-    finalIdx= baseIdx+skip
-    if finalIdx>3:
-        finalIdx=3
-    baseVal= DIST_LEVELS[baseIdx]
-    nextVal= DIST_LEVELS[finalIdx]
-    shifted= baseVal+ shift
-    chosen= max(shifted, nextVal)
-    if chosen> (130+ TOLERANCE):
-        return None
-    final= None
-    for i, lv in enumerate(DIST_LEVELS):
-        if abs(chosen- lv)<0.5:
-            final= lv
-            break
-        if i<3 and chosen> lv and chosen< DIST_LEVELS[i+1]:
-            final= DIST_LEVELS[i+1]
-            break
-        if i==3 and chosen> lv:
-            final= lv
-            break
-    return final
-
-def try_open_trade(dt, price, sid, sessNum):
-    st = STRAT_STATE[sid]
-    if st["activeTrades"][sessNum] is not None:
-        return
-    z = get_active_zone(dt, sid, sessNum)
-    if not z:
-        return
-    forcedC, zID, bD, nC = z
-
-    r = calc_retraction(dt, price, sid, sessNum)
-    skip, shift = retraction_lookup(r)
-    if skip == -1:
-        if sessNum == 1:
-            st["session1"].allowed = False
-        else:
-            st["session2"].allowed = False
-        logging.debug(f"[Strat{sid}] Session{sessNum} blocked≥46 => no trade")
-        return
-
-    sess = st["session1"] if sessNum == 1 else st["session2"]
-    direction = "BUY" if price < sess.openPrice else "SELL"
-    dist = abs(price - sess.openPrice)
-    if dist < bD:
-        return
-    if dist > (bD + TOLERANCE):
-        return
-
-    finalDist = pick_final_distance(bD, skip, shift)
-    if finalDist is None:
-        return
-    if dist < finalDist:
-        return
-    if dist > (finalDist + TOLERANCE):
-        return
-
-    # ------------------------------------------------------------------
-    #  🔼  ESCALATOR – allow an immediate 100- or 130-pt trade IF:
-    #       • current price is in that band (≤ +9 pts overshoot)
-    #       • we are STILL inside the active zone returned earlier (forcedC not reached)
-    # ------------------------------------------------------------------
-    escalated = False
-    for band in (100, 130):
-        if band > finalDist and (band <= dist <= band + TOLERANCE):
-            # Make sure we haven't left the zone’s open window
-            if dt < forcedC:  # still within zone’s chrono-window
-                finalDist = band
-                escalated = True
-                break  # pick first qualifying band
-    # (optional debug)
-    if escalated:
-        logging.debug(f"[Strat{sid}] escalated target to {finalDist}p at dist={dist:.1f}")
-
-    open_dist_counter[finalDist] += 1
-
-    tr = Trade(sid, direction, price, sessNum, zID, forcedC, dt, finalDist, nC)
-    st["activeTrades"][sessNum] = tr
-    logging.debug(
-        f"[Strat{sid}] OPEN s{sessNum} z{zID} {direction} ent={price:.1f} finalDist={finalDist}, forced={forcedC.time()}, noClose={nC}"
-    )
-
-def manage_trade(dt, price, sid, sessNum):
-    st= STRAT_STATE[sid]
-    tr= st["activeTrades"][sessNum]
-    if not tr or not tr.active:
-        return
-
-    if dt>= tr.forcedClose:
-        close_trade(tr, price, "ForcedClose", dt)
-        return
-
-    dd= abs(price- tr.entry)
-    if dd>= GSL:
-        close_trade(tr, price, "GSL", dt)
-        return
-
-    # update peaks
-    if tr.direction=="BUY":
-        if price> tr.peakHigh:
-            tr.peakHigh= price
-            tr.peakTime= dt
-        if price< tr.peakLow:
-            tr.peakLow= price
-            tr.peakTime= dt
-    else:
-        if price< tr.peakLow:
-            tr.peakLow= price
-            tr.peakTime= dt
-        if price> tr.peakHigh:
-            tr.peakHigh= price
-            tr.peakTime= dt
-
-    if tr.noCloseRules and tr.strategyID!=1:
-        return
-
-    # partial close: if peakProfit is in [32..35] for≥16min => forcibly +32
-    if tr.finalDist>=45 and tr.finalDist<70:
-        skipBreakEven= False
-        if tr.strategyID==2:
-            if tr.sessionID==1 and tr.zoneID==1:
-                skipBreakEven= True
-        elif tr.strategyID==3:
-            skipBreakEven= True
-        elif tr.strategyID==4:
-            if not (tr.sessionID==1 and tr.zoneID==1):
-                skipBreakEven= True
-
-        if tr.direction=="BUY":
-            peakProfit= tr.peakHigh- tr.entry
-        else:
-            peakProfit= tr.entry- tr.peakLow
-
-        elap= minutes_diff(tr.peakTime, dt)
-        if (32<= peakProfit<=35) and elap>=16:
-            # forcibly close at +32
-            if tr.direction=="BUY":
-                forcedP= tr.entry+32
-            else:
-                forcedP= tr.entry-32
-            close_trade(tr, forcedP, "PartialClose32", dt)
-            return
-
-        if not skipBreakEven:
-            if tr.direction=="BUY":
-                mae= tr.entry- tr.peakLow
-            else:
-                mae= tr.peakHigh- tr.entry
-            if mae>=15 and abs(price- tr.entry)<1.0:
-                close_trade(tr, price, "BreakEven-15", dt)
-                return
-
-        holdMins= minutes_diff(tr.peakTime, dt)
-        if holdMins>= TIME_CLOSE_45_69:
-            close_trade(tr, price, "TimeClose16", dt)
-    else:
-        holdMins= minutes_diff(tr.peakTime, dt)
-        if holdMins>= TIME_CLOSE_70_PLUS:
-            close_trade(tr, price, "TimeClose31", dt)
-
-def hard_close_pips(direction, entry, final_pips, peakProfit, level):
-    # if peakProfit≥level => forcibly close at +level
-    if peakProfit>= level:
-        return float(level)
-    return float(final_pips)
-
-def close_trade(tr, price, reason, dt):
-    st= STRAT_STATE[tr.strategyID]
-    pl= (price- tr.entry) if tr.direction=="BUY" else (tr.entry- price)
-
-    if tr.direction=="BUY":
-        peakProfitPips= tr.peakHigh- tr.entry
-        peakDrawdownPips= tr.entry- tr.peakLow
-    else:
-        peakProfitPips= tr.entry- tr.peakLow
-        peakDrawdownPips= tr.peakHigh- tr.entry
-
-    hc_50=  hard_close_pips(tr.direction, tr.entry, pl, peakProfitPips, 50)
-    hc_60=  hard_close_pips(tr.direction, tr.entry, pl, peakProfitPips, 60)
-    hc_70=  hard_close_pips(tr.direction, tr.entry, pl, peakProfitPips, 70)
-    hc_80=  hard_close_pips(tr.direction, tr.entry, pl, peakProfitPips, 80)
-    hc_90=  hard_close_pips(tr.direction, tr.entry, pl, peakProfitPips, 90)
-    hc_100= hard_close_pips(tr.direction, tr.entry, pl, peakProfitPips, 100)
-
-    cdict= {
-      "strategy":  tr.strategyID,
-      "session":   tr.sessionID,
-      "zone":      tr.zoneID,
-      "dir":       tr.direction,
-      "entry":     tr.entry,
-      "exit":      price,
-      "pips":      pl,
-      "hc_50":     hc_50,
-      "hc_60":     hc_60,
-      "hc_70":     hc_70,
-      "hc_80":     hc_80,
-      "hc_90":     hc_90,
-      "hc_100":    hc_100,
-      "reason":    reason,
-      "openTime":  tr.openTime,
-      "closeTime": dt,
-      "finalDist": tr.finalDist,
-
-      "peakProfitPips":  peakProfitPips,
-      "peakDrawdownPips":peakDrawdownPips,
-    }
-    st["closedTrades"].append(cdict)
-
-    close_reason_counter[(tr.strategyID, reason)] +=1
-    logging.info(f"[Close] Strat{tr.strategyID} s{tr.sessionID} z{tr.zoneID} {tr.direction} "
-                 f"ent={tr.entry:.1f} exit={price:.1f} pips={pl:.1f} reason={reason} "
-                 f"(peakProfit={peakProfitPips:.1f}, peakDD={peakDrawdownPips:.1f})")
-
-    tr.active= False
-    st["activeTrades"][tr.sessionID]= None
-
-    # aggregator
-    sid= tr.strategyID
-    y= dt.year
-    m= dt.month
-    b= data[(sid,y,m)]
-    b["count"]+=1
-    if pl>0: b["wins"]+=1
-    else:    b["loses"]+=1
-
-    b["pips_list"].append(pl)
-    b["hc_50_list"].append(hc_50)
-    b["hc_60_list"].append(hc_60)
-    b["hc_70_list"].append(hc_70)
-    b["hc_80_list"].append(hc_80)
-    b["hc_90_list"].append(hc_90)
-    b["hc_100_list"].append(hc_100)
-
-    b["sumDD"]+= peakDrawdownPips
-    if peakDrawdownPips> b["maxDD"]: b["maxDD"]= peakDrawdownPips
-    b["sumProfitPeak"]+= peakProfitPips
-    if peakProfitPips> b["maxProfitPeak"]: b["maxProfitPeak"]= peakProfitPips
-
-    # major metrics => distance buckets
-    mm= majorMetrics[(sid,y)]
-    # session
-    if tr.sessionID==1:
-        mm["session1_list"].append(pl)
-    else:
-        mm["session2_list"].append(pl)
-    # zone
-    if tr.zoneID>=1 and tr.zoneID<=4:
-        mm[f"zone{tr.zoneID}_list"].append(pl)
-
-    d_= tr.finalDist
-    if 45<= d_<70:
-        mm["dist45_69_list"].append(pl)
-    elif 70<= d_<100:
-        mm["dist70_99_list"].append(pl)
-    elif 100<= d_<130:
-        mm["dist100_129_list"].append(pl)
-    else:
-        if d_>=130:
-            mm["dist130_plus_list"].append(pl)
-
-# -------------------------------------------------------------------------
-def check_sweeps(dt, price, sid, sessNum):
-    st= STRAT_STATE[sid]
-    tr= st["activeTrades"][sessNum]
-    if not tr or not tr.active: return
-    sess= st["session1"] if sessNum==1 else st["session2"]
-    if sess.active and sess.openPrice is not None:
-        dist= abs(price- sess.openPrice)
-        if dist>= SWEEP_CLOSE:
-            close_trade(tr, price, f"Sweep≥{SWEEP_CLOSE}", dt)
-
-def check_outside_sessions(dt, price, sid, sessNum):
-    s1_in= in_time_window(dt, *SESSION1_START, *SESSION1_END)
-    s2_in= in_time_window(dt, *SESSION2_START, *SESSION2_END)
-    if not s1_in and not s2_in:
-        st= STRAT_STATE[sid]
-        tr= st["activeTrades"][sessNum]
-        if tr and tr.active:
-            close_trade(tr, price, "OutsideSessions", dt)
-
-def check_volatility(dt, price, sid):
-    st= STRAT_STATE[sid]
-    if dt.hour==17 and dt.minute==16:
-        st["overnightRef"]= price
-    if dt.hour==8 and dt.minute==0:
-        if st["overnightRef"] is not None:
-            if abs(price- st["overnightRef"])>= OVERNIGHT_LIMIT:
-                st["session1"].allowed= False
-                logging.debug(f"[Strat {sid}] session1 blocked≥200 overnight")
-        st["overnightRef"]= None
-    if dt.hour==12 and dt.minute==0:
-        st["middayRef"]= price
-    if dt.hour==14 and dt.minute==30:
-        if st["middayRef"] is not None:
-            if abs(price- st["middayRef"])>= MIDDAY_LIMIT:
-                st["session2"].allowed= False
-                logging.debug(f"[Strat {sid}] session2 blocked≥150 midday")
-        st["middayRef"]= None
-
-# -------------------------------------------------------------------------
-def run_backtest(csv_file, yrs, src_tz, dst_tz, produce_excel=False, out_dir="."):
-    init_strategy_states()
-
-    tzSrc= ZoneInfo(src_tz)
-    tzDst= ZoneInfo(dst_tz)
-
-    f= pathlib.Path(csv_file)
-    if not f.is_file():
-        logging.error(f"CSV file not found: {csv_file}")
-        return
-
-    with f.open("r", newline="") as fh:
-        rdr= csv.reader(fh, delimiter=';')
-        naive= None
-        for row in rdr:
-            if len(row)<6: continue
-            dstr= row[0].strip()
-            tstr= row[1].strip()
-            dtRaw= f"{dstr} {tstr}"
-            try:
-                naive= datetime.strptime(dtRaw, "%d/%m/%Y %H:%M:%S")
-            except:
-                continue
-
-            dtSrc= naive.replace(tzinfo=tzSrc)
-            dt= dtSrc.astimezone(tzDst)
-            if dt.year not in yrs:
-                continue
-
-            try:
-                op= float(row[2])
-                hi= float(row[3])
-                lo= float(row[4])
-                cl= float(row[5])
-            except:
-                continue
-
-            for sid in (1,2,3,4):
-                daily_reset_if_new_date(dt, sid)
-
-            for p in [lo, hi]:
-                for sid in (1,2,3,4):
-                    handle_session(dt, p, sid, 1)
-                    handle_session(dt, p, sid, 2)
-                    check_volatility(dt, p, sid)
-                    check_sweeps(dt, p, sid, 1)
-                    check_sweeps(dt, p, sid, 2)
-                    check_outside_sessions(dt, p, sid, 1)
-                    check_outside_sessions(dt, p, sid, 2)
-                    try_open_trade(dt, p, sid, 1)
-                    try_open_trade(dt, p, sid, 2)
-                    manage_trade(dt, p, sid, 1)
-                    manage_trade(dt, p, sid, 2)
-
-        if naive:
-            last_dt= naive.replace(tzinfo=tzSrc).astimezone(tzDst)
-            for sid in (1,2,3,4):
-                st= STRAT_STATE[sid]
-                for sID,tr in st["activeTrades"].items():
-                    if tr and tr.active:
-                        close_trade(tr, tr.entry, "EndOfBacktest", last_dt)
-
-    produce_summaries_and_excel_single_sheet(yrs, out_dir, produce_excel)
-
-# -------------------------------------------------------------------------
-def median(lst):
-    if not lst:
-        return 0.0
-    s= sorted(lst)
-    n= len(s)
-    mid= n//2
-    if n%2==1:
-        return s[mid]
-    return (s[mid-1]+ s[mid])/2.0
-
-# -------------------------------------------------------------------------
-def produce_summaries_and_excel_single_sheet(yrs, out_dir, produce_excel):
-    if not produce_excel:
-        logging.info("Excel not requested => skipping summary.")
-        return
-    if not HAVE_OPENPYXL:
-        logging.warning("openpyxl not installed => skipping summary.")
-        return
-
-    import openpyxl
-    from openpyxl.styles import Font
-
-    all_keys= list(data.keys())
-    if not all_keys:
-        logging.info("No trades => no excel.")
-        return
-
-    sids_in= sorted({k[0] for k in all_keys})
-    yrs_in= sorted({k[1] for k in all_keys})
-    multi_year_str= f"{min(yrs_in)}-{max(yrs_in)}"
-    date_tag= datetime.now().strftime("%Y%m%d")
-
-    wb= openpyxl.Workbook()
-    ws= wb.active
-    ws.title= "Summary"
-
-    row=1
-    # (1) List All Trades
-    ws.cell(row=row, column=1, value="(1) List All Trades").font= Font(bold=True)
-    row+=2
-
-    heads_1= [
-      "Strategy","Year","Month","Trades",
-      "pips","hc_50","hc_60","hc_70","hc_80","hc_90","hc_100",
-      "peakProfit","peakDrawdown","reason","openTime","closeTime"
-    ]
-    for c_i,h_ in enumerate(heads_1,1):
-        ws.cell(row=row,column=c_i,value=h_).font= Font(bold=True)
-    row+=1
-
-    bigList= []
-    for sid in sids_in:
-        for cT in STRAT_STATE[sid]["closedTrades"]:
-            y_= cT["closeTime"].year
-            m_= cT["closeTime"].month
-            bigList.append((sid,y_,m_, cT))
-    bigList.sort(key=lambda x:(x[0],x[1],x[2],x[3]["closeTime"]))
-
-    # aggregator for (1B)
-    sub_1B= defaultdict(lambda: {
-      "count":0, "pips":0.0,
-      "hc_50":0.0,"hc_60":0.0,"hc_70":0.0,"hc_80":0.0,"hc_90":0.0,"hc_100":0.0
-    })
-
-    for (sid,y_,m_, cT) in bigList:
-        c=1
-        ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-        ws.cell(row=row,column=c,value=y_); c+=1
-        ws.cell(row=row,column=c,value=m_); c+=1
-        ws.cell(row=row,column=c,value=1); c+=1
-
-        ws.cell(row=row,column=c,value=round(cT["pips"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_50"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_60"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_70"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_80"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_90"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_100"],1)); c+=1
-
-        ws.cell(row=row,column=c,value=round(cT["peakProfitPips"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["peakDrawdownPips"],1)); c+=1
-        ws.cell(row=row,column=c,value=cT["reason"]); c+=1
-        ws.cell(row=row,column=c,value=cT["openTime"].strftime("%Y-%m-%d %H:%M")); c+=1
-        ws.cell(row=row,column=c,value=cT["closeTime"].strftime("%Y-%m-%d %H:%M")); c+=1
-
-        subKey= (sid,y_)
-        sub_1B[subKey]["count"]+=1
-        sub_1B[subKey]["pips"]+= cT["pips"]
-        sub_1B[subKey]["hc_50"]+= cT["hc_50"]
-        sub_1B[subKey]["hc_60"]+= cT["hc_60"]
-        sub_1B[subKey]["hc_70"]+= cT["hc_70"]
-        sub_1B[subKey]["hc_80"]+= cT["hc_80"]
-        sub_1B[subKey]["hc_90"]+= cT["hc_90"]
-        sub_1B[subKey]["hc_100"]+= cT["hc_100"]
-
-        row+=1
-
-    row+=2
-    # (1B) Subtotals
-    ws.cell(row=row,column=1,value="(1B) Subtotals by (Strategy,Year)").font=Font(bold=True)
-    row+=2
-
-    heads_1B= [
-      "Strategy","Year","Trades","SumPips","SumHC50","SumHC60","SumHC70","SumHC80","SumHC90","SumHC100"
-    ]
-    for c_i,h_ in enumerate(heads_1B,1):
-        ws.cell(row=row,column=c_i,value=h_).font= Font(bold=True)
-    row+=1
-
-    for (sid, yy), ag_ in sorted(sub_1B.items()):
-        c=1
-        ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-        ws.cell(row=row,column=c,value=yy); c+=1
-        ws.cell(row=row,column=c,value=ag_["count"]); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["pips"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_50"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_60"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_70"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_80"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_90"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_100"],1)); c+=1
-        row+=1
-
-    row+=2
-
-    # (2) Totals By Strategy
-    ws.cell(row=row,column=1,value="(2) Totals By Strategy (multi-year)").font= Font(bold=True)
-    row+=2
-
-    heads_2= [
-      "Strategy","YearRange","Trades","NetPips",
-      "Wins","Loses","WinRate",
-      "AvgDrawdown","MaxDrawdown","AvgPeakProfit","MaxPeakProfit",
-      "AvgPipsAll","MedPipsAll",
-      "AvgWinsOnly","MedWinsOnly",
-      "AvgLossOnly","MedLossOnly",
-      "AvgHC_50","MedHC_50",
-      "AvgHC_60","MedHC_60",
-      "AvgHC_70","MedHC_70",
-      "AvgHC_80","MedHC_80",
-      "AvgHC_90","MedHC_90",
-      "AvgHC_100","MedHC_100",
-    ]
-    for c_i, h_ in enumerate(heads_2,1):
-        ws.cell(row=row,column=c_i,value=h_).font= Font(bold=True)
-    row+=1
-
-    def gather_multi_year_stats(sid):
-        allp=[]
-        hc50=[]
-        hc60=[]
-        hc70=[]
-        hc80=[]
-        hc90=[]
-        hc100=[]
-        tcount=0
-        tw=0
-        tl=0
-        sDD=0
-        mDD=0
-        sPk=0
-        mPk=0
-        for (ss,yy,mm), b_ in data.items():
-            if ss==sid:
-                tcount+= b_["count"]
-                tw    += b_["wins"]
-                tl    += b_["loses"]
-                sDD   += b_["sumDD"]
-                if b_["maxDD"]> mDD: mDD= b_["maxDD"]
-                sPk   += b_["sumProfitPeak"]
-                if b_["maxProfitPeak"]> mPk: mPk= b_["maxProfitPeak"]
-
-                allp.extend(b_["pips_list"])
-                hc50.extend(b_["hc_50_list"])
-                hc60.extend(b_["hc_60_list"])
-                hc70.extend(b_["hc_70_list"])
-                hc80.extend(b_["hc_80_list"])
-                hc90.extend(b_["hc_90_list"])
-                hc100.extend(b_["hc_100_list"])
-        return {
-          "count": tcount,
-          "wins": tw,
-          "loses": tl,
-          "sumDD": sDD,
-          "maxDD": mDD,
-          "sumPk": sPk,
-          "maxPk": mPk,
-          "pips": allp,
-          "hc_50":hc50,
-          "hc_60":hc60,
-          "hc_70":hc70,
-          "hc_80":hc80,
-          "hc_90":hc90,
-          "hc_100":hc100
-        }
-
-    def do_avg_med(lst):
-        if not lst: return (0.0,0.0)
-        s= sum(lst)
-        a= s/ len(lst)
-        m= median(lst)
-        return (a,m)
-
-    for sid in sids_in:
-        st_= gather_multi_year_stats(sid)
-        c_= st_["count"]
-        w_= st_["wins"]
-        l_= st_["loses"]
-        wr_= (w_/c_*100) if c_>0 else 0
-        avgDD_= st_["sumDD"]/ c_ if c_>0 else 0
-        mxDD_= st_["maxDD"]
-        avgPk_= st_["sumPk"]/ c_ if c_>0 else 0
-        mxPk_= st_["maxPk"]
-
-        allp= st_["pips"]
-        sumAll= sum(allp)
-        avgAll= sumAll/ len(allp) if allp else 0
-        medAll= median(allp)
-        winp= [x for x in allp if x>0]
-        losp= [x for x in allp if x<=0]
-        avgW= sum(winp)/ len(winp) if winp else 0
-        medW= median(winp) if winp else 0
-        avgL= sum(losp)/ len(losp) if losp else 0
-        medL= median(losp) if losp else 0
-
-        a50,m50= do_avg_med(st_["hc_50"])
-        a60,m60= do_avg_med(st_["hc_60"])
-        a70,m70= do_avg_med(st_["hc_70"])
-        a80,m80= do_avg_med(st_["hc_80"])
-        a90,m90= do_avg_med(st_["hc_90"])
-        a100,m100= do_avg_med(st_["hc_100"])
-
-        c=1
-        ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-        ws.cell(row=row,column=c,value=multi_year_str); c+=1
-        ws.cell(row=row,column=c,value=c_); c+=1
-        ws.cell(row=row,column=c,value=round(sumAll,1)); c+=1
-        ws.cell(row=row,column=c,value=w_); c+=1
-        ws.cell(row=row,column=c,value=l_); c+=1
-        ws.cell(row=row,column=c,value=round(wr_,1)); c+=1
-        ws.cell(row=row,column=c,value=round(avgDD_,1)); c+=1
-        ws.cell(row=row,column=c,value=round(mxDD_,1)); c+=1
-        ws.cell(row=row,column=c,value=round(avgPk_,1)); c+=1
-        ws.cell(row=row,column=c,value=round(mxPk_,1)); c+=1
-
-        ws.cell(row=row,column=c,value=round(avgAll,1)); c+=1
-        ws.cell(row=row,column=c,value=round(medAll,1)); c+=1
-        ws.cell(row=row,column=c,value=round(avgW,1)); c+=1
-        ws.cell(row=row,column=c,value=round(medW,1)); c+=1
-        ws.cell(row=row,column=c,value=round(avgL,1)); c+=1
-        ws.cell(row=row,column=c,value=round(medL,1)); c+=1
-
-        for (av_,md_) in [(a50,m50),(a60,m60),(a70,m70),(a80,m80),(a90,m90),(a100,m100)]:
-            ws.cell(row=row,column=c,value=round(av_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(md_,1)); c+=1
-
-        row+=1
-
-    row+=2
-
-    # (3) Totals By Month
-    ws.cell(row=row,column=1,value="(3) Totals By Month (multi-year)").font= Font(bold=True)
-    row+=2
-
-    heads_3= [
-      "Strategy","YearRange","Month","Trades","NetPips","Wins","Loses","WinRate",
-      "AvgDrawdown","MaxDrawdown","AvgPeakProfit","MaxPeakProfit",
-      "AvgPipsAll","MedPipsAll","AvgWin","MedWin","AvgLoss","MedLoss",
-      "AvgHC_50","MedHC_50",
-      "AvgHC_60","MedHC_60",
-      "AvgHC_70","MedHC_70",
-      "AvgHC_80","MedHC_80",
-      "AvgHC_90","MedHC_90",
-      "AvgHC_100","MedHC_100",
-    ]
-    for c_i,h_ in enumerate(heads_3,1):
-        ws.cell(row=row,column=c_i,value=h_).font= Font(bold=True)
-    row+=1
-
-    monthlyAgg= defaultdict(aggregator_factory)
-    for (sid_, y_, m_), b_ in data.items():
-        ma= monthlyAgg[(sid_, m_)]
-        ma["count"] += b_["count"]
-        ma["wins"]  += b_["wins"]
-        ma["loses"] += b_["loses"]
-
-        ma["pips_list"].extend(b_["pips_list"])
-        ma["hc_50_list"].extend(b_["hc_50_list"])
-        ma["hc_60_list"].extend(b_["hc_60_list"])
-        ma["hc_70_list"].extend(b_["hc_70_list"])
-        ma["hc_80_list"].extend(b_["hc_80_list"])
-        ma["hc_90_list"].extend(b_["hc_90_list"])
-        ma["hc_100_list"].extend(b_["hc_100_list"])
-
-        ma["sumDD"]  += b_["sumDD"]
-        if b_["maxDD"]> ma["maxDD"]:
-            ma["maxDD"]= b_["maxDD"]
-        ma["sumProfitPeak"]+= b_["sumProfitPeak"]
-        if b_["maxProfitPeak"]> ma["maxProfitPeak"]:
-            ma["maxProfitPeak"]= b_["maxProfitPeak"]
-
-    def do_avg_med(lst):
-        if not lst: return (0.0,0.0)
-        s= sum(lst)
-        a= s/ len(lst)
-        m= median(lst)
-        return (a,m)
-
-    for sid in sids_in:
-        for m_ in range(1,13):
-            rec= monthlyAgg.get((sid,m_), None)
-            if not rec or rec["count"]<=0:
-                continue
-            c_= rec["count"]
-            w_= rec["wins"]
-            l_= rec["loses"]
-            wr_= (w_/c_*100) if c_>0 else 0
-            avgDD_= rec["sumDD"]/ c_ if c_>0 else 0
-            mxDD_= rec["maxDD"]
-            avgPk_= rec["sumProfitPeak"]/ c_ if c_>0 else 0
-            mxPk_= rec["maxProfitPeak"]
-
-            allp= rec["pips_list"]
-            sumAll= sum(allp)
-            avgAll= sumAll/ len(allp) if allp else 0
-            medAll= median(allp)
-            winp= [x for x in allp if x>0]
-            losp= [x for x in allp if x<=0]
-            avgW= sum(winp)/ len(winp) if winp else 0
-            medW= median(winp) if winp else 0
-            avgL= sum(losp)/ len(losp) if losp else 0
-            medL= median(losp) if losp else 0
-
-            a50,m50= do_avg_med(rec["hc_50_list"])
-            a60,m60= do_avg_med(rec["hc_60_list"])
-            a70,m70= do_avg_med(rec["hc_70_list"])
-            a80,m80= do_avg_med(rec["hc_80_list"])
-            a90,m90= do_avg_med(rec["hc_90_list"])
-            a100,m100= do_avg_med(rec["hc_100_list"])
-
-            c=1
-            ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-            ws.cell(row=row,column=c,value=multi_year_str); c+=1
-            ws.cell(row=row,column=c,value=m_); c+=1
-            ws.cell(row=row,column=c,value=c_); c+=1
-            ws.cell(row=row,column=c,value=round(sumAll,1)); c+=1
-            ws.cell(row=row,column=c,value=w_); c+=1
-            ws.cell(row=row,column=c,value=l_); c+=1
-            ws.cell(row=row,column=c,value=round(wr_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(avgDD_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(mxDD_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(avgPk_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(mxPk_,1)); c+=1
-
-            ws.cell(row=row,column=c,value=round(avgAll,1)); c+=1
-            ws.cell(row=row,column=c,value=round(medAll,1)); c+=1
-            ws.cell(row=row,column=c,value=round(avgW,1)); c+=1
-            ws.cell(row=row,column=c,value=round(medW,1)); c+=1
-            ws.cell(row=row,column=c,value=round(avgL,1)); c+=1
-            ws.cell(row=row,column=c,value=round(medL,1)); c+=1
-
-            for (av_,md_) in [(a50,m50),(a60,m60),(a70,m70),(a80,m80),(a90,m90),(a100,m100)]:
-                ws.cell(row=row,column=c,value=round(av_,1)); c+=1
-                ws.cell(row=row,column=c,value=round(md_,1)); c+=1
-
-            row+=1
-
-    row+=2
-
-    # (4) Year x Strategy pivot (only final columns, removing “hc_x” columns)
-    ws.cell(row=row,column=1,value="(4) Year x Strategy pivot (only *_final, no hc columns)").font= Font(bold=True)
-    row+=2
-
-    # pivot_final[(sid,year)] = sum of final pips
-    pivot_final= defaultdict(float)
-    # We do not build pivot for hc_x here.
-
-    allYears= sorted({k[1] for k in data.keys()})
-    for (sid_,y_,m_), buk in data.items():
-        pivot_final[(sid_,y_)] += sum(buk["pips_list"])
-
-    colStart=1
-    ws.cell(row=row,column=colStart, value="Year").font= Font(bold=True)
-    c_= colStart+1
-    for sid_ in (1,2,3,4):
-        ws.cell(row=row,column=c_, value=f"{STRATEGY_NAMES[sid_]}_final").font= Font(bold=True)
-        c_+=1
-    ws.cell(row=row,column=c_, value="Total_final").font= Font(bold=True)
-    # done, no more _hcXX columns
-    row+=1
-
-    for y_ in allYears:
-        c_= colStart
-        ws.cell(row=row,column=c_, value=y_)
-        c_+=1
-        yearTot= 0.0
-        for sid_ in (1,2,3,4):
-            val_ = pivot_final.get((sid_,y_), 0.0)
-            ws.cell(row=row,column=c_, value=round(val_,1))
-            c_+=1
-            yearTot+= val_
-        ws.cell(row=row,column=c_, value=round(yearTot,1))
-        row+=1
-
-    row+=2
-
-    # (5) Major Metrics table
-    ws.cell(row=row,column=1,value="(5) Major Metrics Table").font= Font(bold=True)
-    row+=2
-
-    rowHeaders= [
-      "Session1","Session2",
-      "Zone1","Zone2","Zone3","Zone4",
-      "Dist45_69","Dist70_99","Dist100_129","Dist130_plus"
-    ]
-    ws.cell(row=row,column=1,value="Strategy").font= Font(bold=True)
-    ws.cell(row=row,column=2,value="MetricName").font= Font(bold=True)
-    c_=3
-    sorted_yrs= sorted(yrs_in)
-    for y_ in sorted_yrs:
-        ws.cell(row=row,column=c_, value=str(y_)).font= Font(bold=True)
-        c_+=1
-    ws.cell(row=row,column=c_, value="All").font= Font(bold=True)
-    row+=1
-
-    def mm_sum(lst):
-        return sum(lst) if lst else 0.0
-
-    mmAllSid= defaultdict(major_metrics_factory)
-    for sid in sids_in:
-        for rH in rowHeaders:
-            ws.cell(row=row,column=1,value=STRATEGY_NAMES[sid])
-            ws.cell(row=row,column=2,value=rH)
-            c_=3
-            combinedAll= []
-            for y_ in sorted_yrs:
-                mmX= majorMetrics.get((sid,y_), None)
-                if not mmX:
-                    val=0.0
-                else:
-                    # e.g. "Zone1" => "zone1_list"
-                    # "Dist100_129" => "dist100_129_list"
-                    key_= rH.lower()+"_list"
-                    if key_ not in mmX:
-                        val=0.0
-                    else:
-                        arr= mmX[key_]
-                        val= mm_sum(arr)
-                        combinedAll.extend(arr)
-                ws.cell(row=row,column=c_, value=round(val,1))
-                c_+=1
-            totVal= round(mm_sum(combinedAll),1)
-            ws.cell(row=row,column=c_, value=totVal)
-            mmAllSid[sid][key_].extend(combinedAll)
-            row+=1
-        row+=1
-
-    # final row for each strategy
-    for sid in sids_in:
-        ws.cell(row=row,column=1,value=f"{STRATEGY_NAMES[sid]}-All(Metrics)").font=Font(bold=True)
-        row+=1
-        for rH in rowHeaders:
-            key_= rH.lower()+"_list"
-            arr= mmAllSid[sid][key_]
-            val_= mm_sum(arr)
-            ws.cell(row=row,column=2,value=rH).font=Font(bold=True)
-            ws.cell(row=row,column=3,value=round(val_,1)).font=Font(bold=True)
-            row+=1
-        row+=2
-
-    # (6) “Optimal Levels Analysis”
-    row+=1
-    ws.cell(row=row,column=1,value="(6) Optimal Levels Analysis").font=Font(bold=True)
-    row+=2
-
-    headers_6= [
-      "Strategy","Trades",
-      "Hit_50%","Hit_60%","Hit_70%","Hit_80%","Hit_90%","Hit_100%",
-      "Net@50","Net@60","Net@70","Net@80","Net@90","Net@100",
-      "Best_TP","Best_Net","Median_DD","P75_DD","Suggested_SL_Range"
-    ]
-    for c_i, hh in enumerate(headers_6,1):
-        ws.cell(row=row,column=c_i,value=hh).font= Font(bold=True)
-    row+=1
-
-    def pct(a,b):
-        return round(a/b*100,1) if b>0 else 0.0
-
-    for sid in sids_in:
-        trades= STRAT_STATE[sid]["closedTrades"]
-        n= len(trades)
-        if n==0:
-            continue
-        hit_ct= {L:0 for L in(50,60,70,80,90,100)}
-        net_if= {L:0.0 for L in(50,60,70,80,90,100)}
-        dd_list= []
-        for cT in trades:
-            pk= cT["peakProfitPips"]
-            real= cT["pips"]
-            dd_list.append(cT["peakDrawdownPips"])
-            for L in (50,60,70,80,90,100):
-                if pk< L:
-                    net_if[L]+= real
-                else:
-                    net_if[L]+= L
-                    hit_ct[L]+=1
-
-        from statistics import median as stat_median
-        dd_list.sort()
-        med_dd= stat_median(dd_list) if dd_list else 0
-        i75= int(0.75*len(dd_list))
-        p75= dd_list[i75] if i75<len(dd_list) else med_dd
-        hint_= f"{round(med_dd)}–{round(p75)}"
-
-        best_L, best_val= max(net_if.items(), key=lambda kv: kv[1])
-
-        c=1
-        ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-        ws.cell(row=row,column=c,value=n); c+=1
-        for L in (50,60,70,80,90,100):
-            ws.cell(row=row,column=c,value= pct(hit_ct[L],n)); c+=1
-        for L in (50,60,70,80,90,100):
-            cell= ws.cell(row=row,column=c,value= round(net_if[L],1))
-            if L== best_L:
-                cell.fill= PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            c+=1
-
-        ws.cell(row=row,column=c,value=best_L).fill= PatternFill(start_color="C6EFCE",end_color="C6EFCE",fill_type="solid"); c+=1
-        ws.cell(row=row,column=c,value=round(best_val,1)).fill= PatternFill(start_color="C6EFCE",end_color="C6EFCE",fill_type="solid"); c+=1
-        ws.cell(row=row,column=c,value=round(med_dd,1)); c+=1
-        ws.cell(row=row,column=c,value=round(p75,1)); c+=1
-        ws.cell(row=row,column=c,value= hint_); c+=1
-
-        row+=1
-
-    outp= pathlib.Path(out_dir)/ f"results_{date_tag}.xlsx"
-    wb.save(outp)
-    logging.info(f"Excel file saved => {outp}")
-
-
-def main():
-    args= parse_args()
-    yrs= parse_year_range(args.year_range)
-    yr_tag= re.sub(r'[^0-9\-]+','_', args.year_range)
-    setup_logging(args.verbose, args.out_dir, yr_tag)
-
-    run_backtest(
-        csv_file=args.csv,
-        yrs= yrs,
-        src_tz= args.src_tz,
-        dst_tz= args.dst_tz,
-        produce_excel= args.excel,
-        out_dir= args.out_dir
-    )
-    logging.info("All years complete.")
-
-    print("\n=== Diagnostics ===")
-    print("Opened trades by finalDist:", open_dist_counter)
-    print("Close reasons by strategy:")
-    for (theSid, theReason), c_ in sorted(close_reason_counter.items()):
-        print(f"  Strat{theSid} – {theReason}: {c_}")
-
-    # Clear to avoid double-counting if script is re-run
-    data.clear()
-    open_dist_counter.clear()
-    close_reason_counter.clear()
-    majorMetrics.clear()
-
-if __name__=="__main__":
-    main()
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   Print("[OnDeinit] reason=", reason);
+}
+
+// ---------------------------------------------------------------------------
+//                          MODULE 3: TIME & SESSION SETUP
+// ---------------------------------------------------------------------------
+void SetupSessions()
+{
+   MqlDateTime dtNow;
+   TimeToStruct(TimeCurrent(), dtNow);
+   string ymd = StringFormat("%04d.%02d.%02d", dtNow.year, dtNow.mon, dtNow.day);
+
+   // Session 1
+   s1.startTime = StringToTime(ymd+" "+Session1Start);
+   s1.endTime   = StringToTime(ymd+" "+Session1End);
+   s1.isActive  = false;
+
+   // Session 2
+   s2.startTime = StringToTime(ymd+" "+Session2Start);
+   s2.endTime   = StringToTime(ymd+" "+Session2End);
+   s2.isActive  = false;
+
+   // forced close times for session 1
+   // zone0 => 09:31, zone1 => 10:06, zone2 & zone3 => 12:31
+   for(int i=0; i<ArraySize(session1Zones); i++)
+   {
+      if(i==0)
+         session1Zones[i].forcedClose = StringToTime(ymd+" 09:31");
+      else if(i==1)
+         session1Zones[i].forcedClose = StringToTime(ymd+" 10:06");
+      else
+         session1Zones[i].forcedClose = StringToTime(ymd+" 12:31");
+   }
+   // forced close times for session 2 => all 17:16
+   for(int j=0; j<ArraySize(session2Zones); j++)
+   {
+      session2Zones[j].forcedClose = StringToTime(ymd+" 17:16");
+   }
+
+   session1Allowed = true;
+   session2Allowed = true;
+   blockSession1   = false;
+   blockSession2   = false;
+
+   skipTomorrowSession1 = false;
+   skipTodaySession2    = false;
+
+   s1.isActive = false;
+   s2.isActive = false;
+
+   Print("[SetupSessions] S1:", Session1Start,"-",Session1End,
+         " S2:", Session2Start,"-",Session2End);
+}
+
+// We'll call this each tick to see if it's time to activate or deactivate sessions
+void CheckSessionState()
+{
+   datetime nowT = TimeCurrent();
+
+   // Session 1
+   if(!s1.isActive && nowT >= s1.startTime && nowT < s1.endTime)
+   {
+      s1.isActive = true;
+      double bidVal = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+      if(bidVal<=0) { RefreshRates(); bidVal=SymbolInfoDouble(SymbolToTrade,SYMBOL_BID);}
+      if(bidVal>0)
+      {
+         s1.openPrice = bidVal;
+         s1.highPrice = bidVal;
+         s1.lowPrice  = bidVal;
+         Print("[Session1] Activated. openPrice=", s1.openPrice);
+      }
+   }
+   else if(s1.isActive && nowT >= s1.endTime)
+   {
+      s1.isActive = false;
+      Print("[Session1] Ended for the day.");
+   }
+
+   // Session 2
+   if(!s2.isActive && nowT >= s2.startTime && nowT < s2.endTime)
+   {
+      s2.isActive = true;
+      double bidVal2= SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+      if(bidVal2<=0) { RefreshRates(); bidVal2=SymbolInfoDouble(SymbolToTrade,SYMBOL_BID);}
+      if(bidVal2>0)
+      {
+         s2.openPrice = bidVal2;
+         s2.highPrice = bidVal2;
+         s2.lowPrice  = bidVal2;
+         Print("[Session2] Activated. openPrice=", s2.openPrice);
+      }
+   }
+   else if(s2.isActive && nowT >= s2.endTime)
+   {
+      s2.isActive = false;
+      Print("[Session2] Ended for the day.");
+   }
+}
+
+// ---------------------------------------------------------------------------
+//                          MODULE 4: ONTICK & ONTIMER
+// ---------------------------------------------------------------------------
+void OnTick()
+{
+   // 1) Adjust bid/ask by dynamic spread
+   if(!AdjustPricesBySpread()) return;
+
+   // 2) Check session states
+   CheckSessionState();
+
+   // 3) If session active, update high/low
+   double adjBid = GlobalVariableGet(globalVarPrefix+"_AdjBid");
+   if(adjBid>0)
+   {
+      if(s1.isActive) UpdateHighLow(s1, adjBid);
+      if(s2.isActive) UpdateHighLow(s2, adjBid);
+   }
+
+   double bidLow  = GlobalVariableGet(globalVarPrefix + "_AdjBidLow");
+   double bidHigh = GlobalVariableGet(globalVarPrefix + "_AdjBidHigh");
+
+   if (bidLow > 0) {
+       UpdateHighLow(s1, bidLow);  // Update session 1 with bidLow
+       UpdateHighLow(s2, bidLow);  // Update session 2 with bidLow
+   }
+
+   if (bidHigh > 0) {
+       UpdateHighLow(s1, bidHigh);  // Update session 1 with bidHigh
+       UpdateHighLow(s2, bidHigh);  // Update session 2 with bidHigh
+   }
+
+   // 4) Attempt to place new trade for session1
+   if(s1.isActive && session1Allowed && !blockSession1 && !skipTomorrowSession1)
+      CheckZonesAndMaybeOpen(s1, session1Zones, ArraySize(session1Zones), 1);
+
+   // 5) Attempt for session2
+   if(s2.isActive && session2Allowed && !blockSession2 && !skipTodaySession2)
+      CheckZonesAndMaybeOpen(s2, session2Zones, ArraySize(session2Zones), 2);
+
+   // 6) Manage open trades
+   ManageOpenTrades();
+}
+
+void OnTimer()
+{
+   // once per minute
+   HandleSweepsAndVolatility();
+}
+
+// ---------------------------------------------------------------------------
+//                           MODULE 5: SPREAD & PRICING
+// ---------------------------------------------------------------------------
+bool AdjustPricesBySpread()
+{
+   double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+   double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
+   if(bid<=0 || ask<=0)
+   {
+      RefreshRates();
+      bid=SymbolInfoDouble(SymbolToTrade,SYMBOL_BID);
+      ask=SymbolInfoDouble(SymbolToTrade,SYMBOL_ASK);
+      if(bid<=0 || ask<=0) return false;
+   }
+
+   double spr = GetSpreadForTime();
+   double adjBid = bid - (spr * Point);
+   double adjAsk = ask + (spr * Point);
+   adjBid = NormalizeDouble(adjBid, _Digits);
+   adjAsk = NormalizeDouble(adjAsk, _Digits);
+
+   GlobalVariableSet(globalVarPrefix+"_AdjBid", adjBid);
+   GlobalVariableSet(globalVarPrefix+"_AdjAsk", adjAsk);
+   GlobalVariableSet(globalVarPrefix+"_Spread", spr);
+
+   return true;
+}
+
+double GetSpreadForTime()
+{
+   if(ForceSpread) return OverriddenSpread;
+
+   datetime nowT = TimeCurrent();
+   int h = TimeHour(nowT);
+   int m = TimeMinute(nowT);
+   int totalMins = h*60 + m;
+
+   for(int i=0; i<ArraySize(spreadSchedule); i++)
+   {
+      int st = StrToMins(spreadSchedule[i].startTime);
+      int en = StrToMins(spreadSchedule[i].endTime);
+      if(st<=en)
+      {
+         if(totalMins>=st && totalMins<=en)
+            return spreadSchedule[i].spreadPoints;
+      }
+      else
+      {
+         // wrap midnight
+         if(totalMins>=st || totalMins<=en)
+            return spreadSchedule[i].spreadPoints;
+      }
+   }
+   return DefaultSpreadPoints;
+}
+
+int StrToMins(string hhmm)
+{
+   int h = (int)StringToInteger(StringSubstr(hhmm,0,2));
+   int m = (int)StringToInteger(StringSubstr(hhmm,3,2));
+   return h*60 + m;
+}
+
+string SanitizeSymbol(string s)
+{
+   StringReplace(s,"(","_");
+   StringReplace(s,")","_");
+   StringReplace(s,"£","GBP");
+   return s;
+}
+
+// ---------------------------------------------------------------------------
+//                         MODULE 6: HIGH/LOW UPDATING
+// ---------------------------------------------------------------------------
+void UpdateHighLow(SessionData &s, double price)
+{
+   if(!s.isActive) return;
+   if(price> s.highPrice) s.highPrice = price;
+   if(price< s.lowPrice ) s.lowPrice  = price;
+}
+
+// ---------------------------------------------------------------------------
+//                       MODULE 7: ZONE CHECK & TRADE ENTRY
+// ---------------------------------------------------------------------------
+void CheckZonesAndMaybeOpen(SessionData &sess, ZoneInfo &zones[], int zCount, int sessionNum)
+{
+   if(!sess.isActive) return;
+
+   // If there's already an open trade for this session => skip
+   if(GetOpenTradeCountForSession(sessionNum)>=1) return;
+
+   // If retraction≥46 => block session if no trades open
+   double r = CalculateRetraction(sess);
+   if(r>=46.0 && GetOpenTradeCountForSession(sessionNum)==0)
+   {
+      if(sessionNum==1) blockSession1=true; else blockSession2=true;
+      Print("[Retraction>=46] Cancel session #", sessionNum);
+      return;
+   }
+
+   datetime nowT = TimeCurrent();
+   double adjBid = GlobalVariableGet(globalVarPrefix+"_AdjBid");
+   if(adjBid<=0) return;
+
+   // We see if "nowT" is inside any zone => that zone's baseDistance + forcedClose + noCloseRules
+   // We'll open only once if found a zone
+   for(int i=0; i<zCount; i++)
+   {
+      if(zones[i].sessionNum != sessionNum) continue;
+
+      datetime zs = StringToTime(GetDateStr()+" "+zones[i].startHHMM);
+      datetime ze = StringToTime(GetDateStr()+" "+zones[i].endHHMM);
+      if(nowT>=zs && nowT<=ze)
+      {
+         // This is our zone
+         double baseDist = zones[i].baseDistance;
+         bool   skipCloseRules = zones[i].noCloseRules; 
+         datetime forcedC = zones[i].forcedClose;
+
+         // We'll figure out if price is above or below the session open
+         bool isAbove=false;
+         double distFromOpen=0;
+         if(adjBid>= sess.openPrice)
+         {
+            isAbove=true;
+            distFromOpen=(adjBid - sess.openPrice)*IDX/Point;
+         }
+         else
+         {
+            isAbove=false;
+            distFromOpen=(sess.openPrice - adjBid)*IDX/Point;
+         }
+
+         // 1) find baseIndex for baseDist in the global array [45,70,100,130]
+         int baseIndex = -1;
+         for(int k=0; k<4; k++)
+         {
+            if(MathAbs(entryLevels[k]-baseDist)<0.001)
+            {
+               baseIndex=k;
+               break;
+            }
+         }
+         if(baseIndex<0)
+         {
+            Print("[CheckZones] Could not find baseIndex for dist=",baseDist);
+            return;
+         }
+
+         // 2) apply retraction skip => finalIndex
+         int finalIndex = DetermineFinalIndexWithRetraction(baseIndex, r);
+         if(finalIndex<0) return; // session block or no valid
+
+         double finalLvl = entryLevels[finalIndex];
+         // If finalLvl > (130+Tolerance) => no trade
+         if(finalLvl>(130+TolerancePoints)) return;
+
+         // 3) check if this level is used
+         if(sessionNum==1 && usedLevelSession1[finalIndex]) return;
+         if(sessionNum==2 && usedLevelSession2[finalIndex]) return;
+
+         // 4) check if currentDist is within [finalLvl, finalLvl+Tolerance]
+         if(distFromOpen< finalLvl) return; // not reached
+         if(distFromOpen> (finalLvl + TolerancePoints)) return; // overshot
+         
+         // 5) place trade
+         double lots = CalculateLotSize();
+         if(lots<=0) return;
+
+         int cmd = (isAbove)? OP_SELL : OP_BUY;
+         bool success = PlaceTradeWithRetry(cmd, lots, sessionNum, finalLvl, forcedC, skipCloseRules);
+         if(success)
+         {
+            // mark used
+            if(sessionNum==1) usedLevelSession1[finalIndex]=true;
+            else usedLevelSession2[finalIndex]=true;
+         }
+
+         // Only one trade attempt per tick, so return
+         return;
+      }
+   }
+}
+
+// We shift from baseIndex by skip if ret≥15, etc. We also addPoints if skipLevels=0 but addPoints>0
+int DetermineFinalIndexWithRetraction(int baseIdx, double ret)
+{
+   int retAction = CheckRetractionRange(ret);
+   if(retAction<0) return -1; // session cancel
+
+   int skip  = retractionTable[retAction].skipLevels;
+   double addPts = retractionTable[retAction].addPoints;
+
+   int finalIndex = baseIdx + skip;
+   if(finalIndex>3) finalIndex=3;
+
+   double baseVal   = entryLevels[baseIdx];
+   double nextVal   = entryLevels[finalIndex];
+   double withAdd   = baseVal + addPts;
+   double chosenDist= MathMax(withAdd, nextVal);
+
+   // see which level that belongs to in [45,70,100,130]
+   // or if it surpasses 130 => no trade
+   if(chosenDist > 130+TolerancePoints) return -1; 
+   // find final index
+   int matched=-1;
+   for(int i=0; i<4; i++)
+   {
+      if(MathAbs(chosenDist - entryLevels[i])<0.5)
+      {
+         matched=i; break;
+      }
+      if(i<3 && chosenDist> entryLevels[i] && chosenDist< entryLevels[i+1])
+      {
+         matched = i+1;
+         break;
+      }
+      if(i==3 && chosenDist>entryLevels[3]) 
+      {
+         matched=3;
+         break;
+      }
+   }
+   return matched;
+}
+
+double CalculateRetraction(SessionData &sess)
+{
+   double bidAdj = GlobalVariableGet(globalVarPrefix+"_AdjBid");
+   if(bidAdj<=0) return 0;
+   if(bidAdj >= sess.openPrice)
+   {
+      // retraction from top
+      double dist = (sess.highPrice - bidAdj)*IDX/Point;
+      return dist;
+   }
+   else
+   {
+      double dist = (bidAdj - sess.lowPrice)*IDX/Point;
+      return dist;
+   }
+}
+
+int CheckRetractionRange(double r)
+{
+   // returns index into retractionTable or -1 if session-cancel
+   for(int i=0; i<4; i++)
+   {
+      if(r>= retractionTable[i].minRetract && r<= retractionTable[i].maxRetract)
+      {
+         if(retractionTable[i].skipLevels==-1) return -1; 
+         return i;
+      }
+   }
+   // if below 15 => no retraction
+   return 0;
+}
+
+// ---------------------------------------------------------------------------
+//                          MODULE 8: PLACING TRADES
+// ---------------------------------------------------------------------------
+bool PlaceTradeWithRetry(int cmd, double lots, int sessionNum, double finalDist, datetime forcedCloseTime, bool noCloseRules)
+{
+   int attempts = 0;
+   double price = (cmd == OP_BUY) ? GlobalVariableGet(globalVarPrefix + "_AdjAsk") : GlobalVariableGet(globalVarPrefix + "_AdjBid");
+   if (price <= 0) return false;
+
+   double slDistPoints = StopLossPoints * IDX * Point;
+   double slPrice = (cmd == OP_BUY) ? (price - slDistPoints) : (price + slDistPoints);
+   slPrice = NormalizeDouble(slPrice, _Digits);
+
+   double stopLevelPoints = MarketInfo(SymbolToTrade, MODE_STOPLEVEL) * Point;
+   if (slDistPoints < stopLevelPoints)
+   {
+      Print("[TradeOpen] StopLoss < broker STOPLEVEL => cannot open trade.");
+      return false;
+   }
+
+   int ticket = -1;
+   for (attempts = 0; attempts < 5; attempts++)
+   {
+      RefreshRates();
+      double usedPrice = (cmd == OP_BUY) ? SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK) : SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+      if (usedPrice <= 0)
+      {
+         Sleep(200);
+         continue;
+      }
+      usedPrice = NormalizeDouble(usedPrice, _Digits);
+
+      ticket = OrderSend(SymbolToTrade, cmd, lots, usedPrice, SlippagePoints,
+                         (cmd == OP_BUY) ? (usedPrice - slDistPoints) : (usedPrice + slDistPoints),
+                         0, "GER30EA", MagicNumber, 0, clrBlue);
+      if (ticket > 0)
+      {
+         Print("[TradeOpen] success #", attempts + 1, " ticket=", ticket, ", lots=", lots,
+               ", SL=", DoubleToString(slPrice, _Digits), ", finalDist=", finalDist, ", noCloseRules=", noCloseRules);
+         for (int i = 0; i < ArraySize(tradeArray); i++)
+         {
+            if (!tradeArray[i].active)
+            {
+               tradeArray[i].ticket = ticket;
+               tradeArray[i].sessionNumber = sessionNum;
+               tradeArray[i].entryPrice = usedPrice;
+               tradeArray[i].peakHigh = usedPrice;
+               tradeArray[i].peakLow = usedPrice;
+               tradeArray[i].peakTime = TimeCurrent();  // Initialize peakTime
+               tradeArray[i].openTime = TimeCurrent();
+               tradeArray[i].forcedCloseTime = forcedCloseTime;
+               tradeArray[i].active = true;
+               tradeArray[i].finalDistanceUsed = finalDist;
+               tradeArray[i].noCloseRules = noCloseRules;
+               break;
+            }
+         }
+         return true;
+      }
+      else
+      {
+         Print("[TradeOpen] fail #", attempts + 1, ", err=", GetLastError());
+         Sleep(500);
+      }
+   }
+   return false;
+}
+
+double CalculateLotSize()
+{
+   double eq = AccountEquity();
+   double raw = eq / BetDivisor;
+   double step = SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_STEP);
+   if(step<=0) step=0.01;
+   double lots = MathFloor(raw/step)*step;
+   double minL= SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_MIN);
+   double maxL= SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_MAX);
+   if(lots< minL) return 0.0;
+   if(lots> maxL) lots = maxL;
+   return NormalizeDouble(lots,2);
+}
+
+int GetOpenTradeCountForSession(int sessNum)
+{
+   int cnt=0;
+   for(int i=0; i<ArraySize(tradeArray); i++)
+   {
+      if(tradeArray[i].active && tradeArray[i].sessionNumber==sessNum)
+         cnt++;
+   }
+   return cnt;
+}
+
+// ---------------------------------------------------------------------------
+//                     MODULE 9: MANAGE OPEN TRADES (CLOSE LOGIC)
+// ---------------------------------------------------------------------------
+void ManageOpenTrades()
+{
+   datetime nowT = TimeCurrent();
+   for (int i = 0; i < ArraySize(tradeArray); i++)
+   {
+      if (!tradeArray[i].active) continue;
+
+      int tk = tradeArray[i].ticket;
+      if (!OrderSelect(tk, SELECT_BY_TICKET, MODE_TRADES))
+      {
+         tradeArray[i].active = false;
+         continue;
+      }
+
+      if (nowT >= tradeArray[i].forcedCloseTime)
+      {
+         CloseTradeWithRetry(tk);
+         tradeArray[i].active = false;
+         continue;
+      }
+
+      if (tradeArray[i].noCloseRules) continue;
+
+      double cp = (OrderType() == OP_BUY) ? SymbolInfoDouble(SymbolToTrade, SYMBOL_BID) : SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
+      if (cp > 0)
+      {
+         if (OrderType() == OP_BUY)
+         {
+            if (cp > tradeArray[i].peakHigh)
+            {
+               tradeArray[i].peakHigh = cp;
+               tradeArray[i].peakTime = nowT;  // Update peakTime
+            }
+            if (cp < tradeArray[i].peakLow) tradeArray[i].peakLow = cp;
+         }
+         else
+         {
+            if (cp < tradeArray[i].peakLow)
+            {
+               tradeArray[i].peakLow = cp;
+               tradeArray[i].peakTime = nowT;  // Update peakTime
+            }
+            if (cp > tradeArray[i].peakHigh) tradeArray[i].peakHigh = cp;
+         }
+      }
+
+      int holdMins = (int)((nowT - tradeArray[i].peakTime) / 60);  // Use peakTime for hold duration
+      double usedDist = tradeArray[i].finalDistanceUsed;
+
+      if (usedDist >= 45 && usedDist < 70)
+      {
+         double openP = OrderOpenPrice();
+         double adv = (OrderType() == OP_BUY) ? (openP - cp) * IDX / Point : (cp - openP) * IDX / Point;
+
+         if (adv >= 15)
+         {
+            double diff = MathAbs(cp - openP) * IDX / Point;
+            if (diff < 1.0)
+            {
+               Print("[BreakEvenClose] #", tk, " => 15 adverse & returned => close@0");
+               CloseTradeWithRetry(tk);
+               tradeArray[i].active = false;
+               continue;
+            }
+         }
+         if (holdMins >= 16)
+         {
+            Print("[TimeClose16] #", tk, ", hold=", holdMins, " => close");
+            CloseTradeWithRetry(tk);
+            tradeArray[i].active = false;
+            continue;
+         }
+      }
+      else if (usedDist >= 70 && usedDist <= 159.9)
+      {
+         if (holdMins >= 31)
+         {
+            Print("[TimeClose31] #", tk, ", hold=", holdMins, " => close");
+            CloseTradeWithRetry(tk);
+            tradeArray[i].active = false;
+            continue;
+         }
+      }
+   }
+}
+
+bool CloseTradeWithRetry(int ticket)
+{
+   if(!OrderSelect(ticket, SELECT_BY_TICKET)) return false;
+   for(int i=0; i<5; i++)
+   {
+      double cp= (OrderType()==OP_BUY)? SymbolInfoDouble(SymbolToTrade, SYMBOL_BID)
+                                      : SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
+      if(cp<=0)
+      {
+         RefreshRates();
+         Sleep(200);
+         continue;
+      }
+      cp= NormalizeDouble(cp, _Digits);
+
+      bool res= OrderClose(ticket, OrderLots(), cp, SlippagePoints, clrRed);
+      if(res)
+      {
+         Print("[CloseTrade] success ticket=", ticket, ", attempt #", i+1);
+         LogCloseInfo(ticket);
+         return true;
+      }
+      else
+      {
+         Print("[CloseTrade] fail #", i+1,", err=", GetLastError());
+         Sleep(500);
+      }
+   }
+   return false;
+}
+
+void LogCloseInfo(int ticket)
+{
+   if(OrderSelect(ticket, SELECT_BY_TICKET, MODE_HISTORY))
+   {
+      double pl= OrderProfit() + OrderSwap() + OrderCommission();
+      PrintFormat("[Closed] #%d %s lots=%.2f open=%.2f close=%.2f P/L=%.2f",
+                  ticket,
+                  (OrderType()==OP_BUY?"BUY":"SELL"),
+                  OrderLots(),
+                  OrderOpenPrice(),
+                  OrderClosePrice(),
+                  pl);
+   }
+}
+
+// ---------------------------------------------------------------------------
+//                   MODULE 10: SWEEPS & VOLATILITY (OnTimer tasks)
+// ---------------------------------------------------------------------------
+void HandleSweepsAndVolatility()
+{
+   datetime nowT= TimeCurrent();
+   if(nowT - lastSweepCheck < 60) return; // once per minute
+   lastSweepCheck= nowT;
+
+   double adjBid=GlobalVariableGet(globalVarPrefix+"_AdjBid");
+   if(adjBid>0)
+   {
+      // 1) if session1 active and distance≥179 => close all
+      if(s1.isActive)
+      {
+         double dist1 = MathAbs(adjBid - s1.openPrice)*IDX/Point;
+         if(dist1>=179.0)
+         {
+            Print("[Sweep] session1 dist=",dist1," => close all trades");
+            CloseAllTradesForSession(1);
+         }
+      }
+      // 2) session2 as well
+      if(s2.isActive)
+      {
+         double dist2 = MathAbs(adjBid - s2.openPrice)*IDX/Point;
+         if(dist2>=179.0)
+         {
+            Print("[Sweep] session2 dist=",dist2," => close all trades");
+            CloseAllTradesForSession(2);
+         }
+      }
+   }
+
+   // 3) if time is outside 08:00–12:30 & 14:30–17:16 => close all trades
+   bool inS1= (nowT>=s1.startTime && nowT<s1.endTime);
+   bool inS2= (nowT>=s2.startTime && nowT<s2.endTime);
+   if(!inS1 && !inS2)
+   {
+      // close any open
+      for(int i=0; i<ArraySize(tradeArray); i++)
+      {
+         if(tradeArray[i].active)
+         {
+            CloseTradeWithRetry(tradeArray[i].ticket);
+            tradeArray[i].active=false;
+         }
+      }
+   }
+
+   // 4) track overnight volatility: if exactly 17:16 => record
+   if(TimeHour(nowT)==17 && TimeMinute(nowT)==16)
+   {
+      overnightStartPrice= SymbolInfoDouble(SymbolToTrade,SYMBOL_BID);
+      Print("[OvernightStart] 17:16 price=",overnightStartPrice);
+   }
+   // if 08:00 => compare with overnight
+   if(TimeHour(nowT)==8 && TimeMinute(nowT)==0)
+   {
+      if(overnightStartPrice>0)
+      {
+         double curBid= SymbolInfoDouble(SymbolToTrade,SYMBOL_BID);
+         double ovDist= MathAbs(curBid - overnightStartPrice)*IDX/Point;
+         if(ovDist>=200.0)
+         {
+            skipTomorrowSession1=true; 
+            Print("[VolatilityBlock] overnight≥200 => skip session1");
+         }
+      }
+      overnightStartPrice=0;
+   }
+
+   // 5) midday volatility: if 12:00 => record
+   if(TimeHour(nowT)==12 && TimeMinute(nowT)==0)
+   {
+      middayStartPrice= SymbolInfoDouble(SymbolToTrade,SYMBOL_BID);
+      Print("[MiddayTrack] 12:00 => ", middayStartPrice);
+   }
+   // if 14:30 => compare
+   if(TimeHour(nowT)==14 && TimeMinute(nowT)==30)
+   {
+      if(middayStartPrice>0)
+      {
+         double cb= SymbolInfoDouble(SymbolToTrade,SYMBOL_BID);
+         double diff= MathAbs(cb - middayStartPrice)*IDX/Point;
+         if(diff>=150.0)
+         {
+            skipTodaySession2= true;
+            Print("[VolatilityBlock] midday≥150 => skip session2");
+         }
+      }
+      middayStartPrice=0;
+   }
+}
+
+void CloseAllTradesForSession(int sessNum)
+{
+   for(int i=0; i<ArraySize(tradeArray); i++)
+   {
+      if(tradeArray[i].active && tradeArray[i].sessionNumber==sessNum)
+      {
+         CloseTradeWithRetry(tradeArray[i].ticket);
+         tradeArray[i].active=false;
+      }
+   }
+}
+
+string GetDateStr()
+{
+   MqlDateTime sdt;
+   TimeToStruct(TimeCurrent(), sdt);
+   return StringFormat("%04d.%02d.%02d", sdt.year, sdt.mon, sdt.day);
+}
+// ---------------------------------------------------------------------------
+//                             END OF FILE
+// ---------------------------------------------------------------------------
