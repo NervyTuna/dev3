@@ -375,16 +375,27 @@ def try_open_trade(dt, price, sid, sessNum):
     dist = abs(price - sess.openPrice)
     if dist < bD:
         return
+    # --- overshoot handling ----------------------------------------------
+    # If price has moved past the base distance tolerance, check if we're
+    # still within the zone and inside the 100/130 bands. Overshoot can
+    # therefore still lead to a trade at the next level.
     if dist > (bD + TOLERANCE):
-        return
-
-    finalDist = pick_final_distance(bD, skip, shift)
-    if finalDist is None:
-        return
-    if dist < finalDist:
-        return
-    if dist > (finalDist + TOLERANCE):
-        return
+        finalDist = None
+        if dt < forcedC:
+            if 100 - TOLERANCE <= dist <= 100 + TOLERANCE:
+                finalDist = 100
+            elif 130 - TOLERANCE <= dist <= 130 + TOLERANCE:
+                finalDist = 130
+        if finalDist is None:
+            return
+    else:
+        finalDist = pick_final_distance(bD, skip, shift)
+        if finalDist is None:
+            return
+        if dist < finalDist:
+            return
+        if dist > (finalDist + TOLERANCE):
+            return
 
     # ------------------------------------------------------------------
     #  🔼  ESCALATOR – allow an immediate 100- or 130-pt trade IF:
@@ -719,520 +730,90 @@ def produce_summaries_and_excel_single_sheet(yrs, out_dir, produce_excel):
         return
 
     import openpyxl
-    from openpyxl.styles import Font
+    from openpyxl.styles import Font, PatternFill
 
-    all_keys= list(data.keys())
+    all_keys = list(data.keys())
     if not all_keys:
         logging.info("No trades => no excel.")
         return
 
-    sids_in= sorted({k[0] for k in all_keys})
-    yrs_in= sorted({k[1] for k in all_keys})
-    multi_year_str= f"{min(yrs_in)}-{max(yrs_in)}"
-    date_tag= datetime.now().strftime("%Y%m%d")
+    sids_in = sorted({k[0] for k in all_keys})
+    yrs_in = sorted({k[1] for k in all_keys})
+    multi_year_str = f"{min(yrs_in)}-{max(yrs_in)}"
+    date_tag = datetime.now().strftime("%Y%m%d")
 
-    wb= openpyxl.Workbook()
-    ws= wb.active
-    ws.title= "Summary"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Summary"
 
-    row=1
-    # (1) List All Trades
-    ws.cell(row=row, column=1, value="(1) List All Trades").font= Font(bold=True)
-    row+=2
-
-    heads_1= [
-      "Strategy","Year","Month","Trades",
-      "pips","hc_50","hc_60","hc_70","hc_80","hc_90","hc_100",
-      "peakProfit","peakDrawdown","reason","openTime","closeTime"
-    ]
-    for c_i,h_ in enumerate(heads_1,1):
-        ws.cell(row=row,column=c_i,value=h_).font= Font(bold=True)
-    row+=1
-
-    bigList= []
-    for sid in sids_in:
-        for cT in STRAT_STATE[sid]["closedTrades"]:
-            y_= cT["closeTime"].year
-            m_= cT["closeTime"].month
-            bigList.append((sid,y_,m_, cT))
-    bigList.sort(key=lambda x:(x[0],x[1],x[2],x[3]["closeTime"]))
-
-    # aggregator for (1B)
-    sub_1B= defaultdict(lambda: {
-      "count":0, "pips":0.0,
-      "hc_50":0.0,"hc_60":0.0,"hc_70":0.0,"hc_80":0.0,"hc_90":0.0,"hc_100":0.0
-    })
-
-    for (sid,y_,m_, cT) in bigList:
-        c=1
-        ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-        ws.cell(row=row,column=c,value=y_); c+=1
-        ws.cell(row=row,column=c,value=m_); c+=1
-        ws.cell(row=row,column=c,value=1); c+=1
-
-        ws.cell(row=row,column=c,value=round(cT["pips"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_50"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_60"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_70"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_80"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_90"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["hc_100"],1)); c+=1
-
-        ws.cell(row=row,column=c,value=round(cT["peakProfitPips"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(cT["peakDrawdownPips"],1)); c+=1
-        ws.cell(row=row,column=c,value=cT["reason"]); c+=1
-        ws.cell(row=row,column=c,value=cT["openTime"].strftime("%Y-%m-%d %H:%M")); c+=1
-        ws.cell(row=row,column=c,value=cT["closeTime"].strftime("%Y-%m-%d %H:%M")); c+=1
-
-        subKey= (sid,y_)
-        sub_1B[subKey]["count"]+=1
-        sub_1B[subKey]["pips"]+= cT["pips"]
-        sub_1B[subKey]["hc_50"]+= cT["hc_50"]
-        sub_1B[subKey]["hc_60"]+= cT["hc_60"]
-        sub_1B[subKey]["hc_70"]+= cT["hc_70"]
-        sub_1B[subKey]["hc_80"]+= cT["hc_80"]
-        sub_1B[subKey]["hc_90"]+= cT["hc_90"]
-        sub_1B[subKey]["hc_100"]+= cT["hc_100"]
-
-        row+=1
-
-    row+=2
-    # (1B) Subtotals
-    ws.cell(row=row,column=1,value="(1B) Subtotals by (Strategy,Year)").font=Font(bold=True)
-    row+=2
-
-    heads_1B= [
-      "Strategy","Year","Trades","SumPips","SumHC50","SumHC60","SumHC70","SumHC80","SumHC90","SumHC100"
-    ]
-    for c_i,h_ in enumerate(heads_1B,1):
-        ws.cell(row=row,column=c_i,value=h_).font= Font(bold=True)
-    row+=1
-
-    for (sid, yy), ag_ in sorted(sub_1B.items()):
-        c=1
-        ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-        ws.cell(row=row,column=c,value=yy); c+=1
-        ws.cell(row=row,column=c,value=ag_["count"]); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["pips"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_50"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_60"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_70"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_80"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_90"],1)); c+=1
-        ws.cell(row=row,column=c,value=round(ag_["hc_100"],1)); c+=1
-        row+=1
-
-    row+=2
-
-    # (2) Totals By Strategy
-    ws.cell(row=row,column=1,value="(2) Totals By Strategy (multi-year)").font= Font(bold=True)
-    row+=2
-
-    heads_2= [
-      "Strategy","YearRange","Trades","NetPips",
-      "Wins","Loses","WinRate",
-      "AvgDrawdown","MaxDrawdown","AvgPeakProfit","MaxPeakProfit",
-      "AvgPipsAll","MedPipsAll",
-      "AvgWinsOnly","MedWinsOnly",
-      "AvgLossOnly","MedLossOnly",
-      "AvgHC_50","MedHC_50",
-      "AvgHC_60","MedHC_60",
-      "AvgHC_70","MedHC_70",
-      "AvgHC_80","MedHC_80",
-      "AvgHC_90","MedHC_90",
-      "AvgHC_100","MedHC_100",
-    ]
-    for c_i, h_ in enumerate(heads_2,1):
-        ws.cell(row=row,column=c_i,value=h_).font= Font(bold=True)
-    row+=1
-
-    def gather_multi_year_stats(sid):
-        allp=[]
-        hc50=[]
-        hc60=[]
-        hc70=[]
-        hc80=[]
-        hc90=[]
-        hc100=[]
-        tcount=0
-        tw=0
-        tl=0
-        sDD=0
-        mDD=0
-        sPk=0
-        mPk=0
-        for (ss,yy,mm), b_ in data.items():
-            if ss==sid:
-                tcount+= b_["count"]
-                tw    += b_["wins"]
-                tl    += b_["loses"]
-                sDD   += b_["sumDD"]
-                if b_["maxDD"]> mDD: mDD= b_["maxDD"]
-                sPk   += b_["sumProfitPeak"]
-                if b_["maxProfitPeak"]> mPk: mPk= b_["maxProfitPeak"]
-
-                allp.extend(b_["pips_list"])
-                hc50.extend(b_["hc_50_list"])
-                hc60.extend(b_["hc_60_list"])
-                hc70.extend(b_["hc_70_list"])
-                hc80.extend(b_["hc_80_list"])
-                hc90.extend(b_["hc_90_list"])
-                hc100.extend(b_["hc_100_list"])
-        return {
-          "count": tcount,
-          "wins": tw,
-          "loses": tl,
-          "sumDD": sDD,
-          "maxDD": mDD,
-          "sumPk": sPk,
-          "maxPk": mPk,
-          "pips": allp,
-          "hc_50":hc50,
-          "hc_60":hc60,
-          "hc_70":hc70,
-          "hc_80":hc80,
-          "hc_90":hc90,
-          "hc_100":hc100
-        }
-
-    def do_avg_med(lst):
-        if not lst: return (0.0,0.0)
-        s= sum(lst)
-        a= s/ len(lst)
-        m= median(lst)
-        return (a,m)
-
-    for sid in sids_in:
-        st_= gather_multi_year_stats(sid)
-        c_= st_["count"]
-        w_= st_["wins"]
-        l_= st_["loses"]
-        wr_= (w_/c_*100) if c_>0 else 0
-        avgDD_= st_["sumDD"]/ c_ if c_>0 else 0
-        mxDD_= st_["maxDD"]
-        avgPk_= st_["sumPk"]/ c_ if c_>0 else 0
-        mxPk_= st_["maxPk"]
-
-        allp= st_["pips"]
-        sumAll= sum(allp)
-        avgAll= sumAll/ len(allp) if allp else 0
-        medAll= median(allp)
-        winp= [x for x in allp if x>0]
-        losp= [x for x in allp if x<=0]
-        avgW= sum(winp)/ len(winp) if winp else 0
-        medW= median(winp) if winp else 0
-        avgL= sum(losp)/ len(losp) if losp else 0
-        medL= median(losp) if losp else 0
-
-        a50,m50= do_avg_med(st_["hc_50"])
-        a60,m60= do_avg_med(st_["hc_60"])
-        a70,m70= do_avg_med(st_["hc_70"])
-        a80,m80= do_avg_med(st_["hc_80"])
-        a90,m90= do_avg_med(st_["hc_90"])
-        a100,m100= do_avg_med(st_["hc_100"])
-
-        c=1
-        ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-        ws.cell(row=row,column=c,value=multi_year_str); c+=1
-        ws.cell(row=row,column=c,value=c_); c+=1
-        ws.cell(row=row,column=c,value=round(sumAll,1)); c+=1
-        ws.cell(row=row,column=c,value=w_); c+=1
-        ws.cell(row=row,column=c,value=l_); c+=1
-        ws.cell(row=row,column=c,value=round(wr_,1)); c+=1
-        ws.cell(row=row,column=c,value=round(avgDD_,1)); c+=1
-        ws.cell(row=row,column=c,value=round(mxDD_,1)); c+=1
-        ws.cell(row=row,column=c,value=round(avgPk_,1)); c+=1
-        ws.cell(row=row,column=c,value=round(mxPk_,1)); c+=1
-
-        ws.cell(row=row,column=c,value=round(avgAll,1)); c+=1
-        ws.cell(row=row,column=c,value=round(medAll,1)); c+=1
-        ws.cell(row=row,column=c,value=round(avgW,1)); c+=1
-        ws.cell(row=row,column=c,value=round(medW,1)); c+=1
-        ws.cell(row=row,column=c,value=round(avgL,1)); c+=1
-        ws.cell(row=row,column=c,value=round(medL,1)); c+=1
-
-        for (av_,md_) in [(a50,m50),(a60,m60),(a70,m70),(a80,m80),(a90,m90),(a100,m100)]:
-            ws.cell(row=row,column=c,value=round(av_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(md_,1)); c+=1
-
-        row+=1
-
-    row+=2
-
-    # (3) Totals By Month
-    ws.cell(row=row,column=1,value="(3) Totals By Month (multi-year)").font= Font(bold=True)
-    row+=2
-
-    heads_3= [
-      "Strategy","YearRange","Month","Trades","NetPips","Wins","Loses","WinRate",
-      "AvgDrawdown","MaxDrawdown","AvgPeakProfit","MaxPeakProfit",
-      "AvgPipsAll","MedPipsAll","AvgWin","MedWin","AvgLoss","MedLoss",
-      "AvgHC_50","MedHC_50",
-      "AvgHC_60","MedHC_60",
-      "AvgHC_70","MedHC_70",
-      "AvgHC_80","MedHC_80",
-      "AvgHC_90","MedHC_90",
-      "AvgHC_100","MedHC_100",
-    ]
-    for c_i,h_ in enumerate(heads_3,1):
-        ws.cell(row=row,column=c_i,value=h_).font= Font(bold=True)
-    row+=1
-
-    monthlyAgg= defaultdict(aggregator_factory)
-    for (sid_, y_, m_), b_ in data.items():
-        ma= monthlyAgg[(sid_, m_)]
-        ma["count"] += b_["count"]
-        ma["wins"]  += b_["wins"]
-        ma["loses"] += b_["loses"]
-
-        ma["pips_list"].extend(b_["pips_list"])
-        ma["hc_50_list"].extend(b_["hc_50_list"])
-        ma["hc_60_list"].extend(b_["hc_60_list"])
-        ma["hc_70_list"].extend(b_["hc_70_list"])
-        ma["hc_80_list"].extend(b_["hc_80_list"])
-        ma["hc_90_list"].extend(b_["hc_90_list"])
-        ma["hc_100_list"].extend(b_["hc_100_list"])
-
-        ma["sumDD"]  += b_["sumDD"]
-        if b_["maxDD"]> ma["maxDD"]:
-            ma["maxDD"]= b_["maxDD"]
-        ma["sumProfitPeak"]+= b_["sumProfitPeak"]
-        if b_["maxProfitPeak"]> ma["maxProfitPeak"]:
-            ma["maxProfitPeak"]= b_["maxProfitPeak"]
-
-    def do_avg_med(lst):
-        if not lst: return (0.0,0.0)
-        s= sum(lst)
-        a= s/ len(lst)
-        m= median(lst)
-        return (a,m)
-
-    for sid in sids_in:
-        for m_ in range(1,13):
-            rec= monthlyAgg.get((sid,m_), None)
-            if not rec or rec["count"]<=0:
-                continue
-            c_= rec["count"]
-            w_= rec["wins"]
-            l_= rec["loses"]
-            wr_= (w_/c_*100) if c_>0 else 0
-            avgDD_= rec["sumDD"]/ c_ if c_>0 else 0
-            mxDD_= rec["maxDD"]
-            avgPk_= rec["sumProfitPeak"]/ c_ if c_>0 else 0
-            mxPk_= rec["maxProfitPeak"]
-
-            allp= rec["pips_list"]
-            sumAll= sum(allp)
-            avgAll= sumAll/ len(allp) if allp else 0
-            medAll= median(allp)
-            winp= [x for x in allp if x>0]
-            losp= [x for x in allp if x<=0]
-            avgW= sum(winp)/ len(winp) if winp else 0
-            medW= median(winp) if winp else 0
-            avgL= sum(losp)/ len(losp) if losp else 0
-            medL= median(losp) if losp else 0
-
-            a50,m50= do_avg_med(rec["hc_50_list"])
-            a60,m60= do_avg_med(rec["hc_60_list"])
-            a70,m70= do_avg_med(rec["hc_70_list"])
-            a80,m80= do_avg_med(rec["hc_80_list"])
-            a90,m90= do_avg_med(rec["hc_90_list"])
-            a100,m100= do_avg_med(rec["hc_100_list"])
-
-            c=1
-            ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-            ws.cell(row=row,column=c,value=multi_year_str); c+=1
-            ws.cell(row=row,column=c,value=m_); c+=1
-            ws.cell(row=row,column=c,value=c_); c+=1
-            ws.cell(row=row,column=c,value=round(sumAll,1)); c+=1
-            ws.cell(row=row,column=c,value=w_); c+=1
-            ws.cell(row=row,column=c,value=l_); c+=1
-            ws.cell(row=row,column=c,value=round(wr_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(avgDD_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(mxDD_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(avgPk_,1)); c+=1
-            ws.cell(row=row,column=c,value=round(mxPk_,1)); c+=1
-
-            ws.cell(row=row,column=c,value=round(avgAll,1)); c+=1
-            ws.cell(row=row,column=c,value=round(medAll,1)); c+=1
-            ws.cell(row=row,column=c,value=round(avgW,1)); c+=1
-            ws.cell(row=row,column=c,value=round(medW,1)); c+=1
-            ws.cell(row=row,column=c,value=round(avgL,1)); c+=1
-            ws.cell(row=row,column=c,value=round(medL,1)); c+=1
-
-            for (av_,md_) in [(a50,m50),(a60,m60),(a70,m70),(a80,m80),(a90,m90),(a100,m100)]:
-                ws.cell(row=row,column=c,value=round(av_,1)); c+=1
-                ws.cell(row=row,column=c,value=round(md_,1)); c+=1
-
-            row+=1
-
-    row+=2
-
-    # (4) Year x Strategy pivot (only final columns, removing “hc_x” columns)
-    ws.cell(row=row,column=1,value="(4) Year x Strategy pivot (only *_final, no hc columns)").font= Font(bold=True)
-    row+=2
-
-    # pivot_final[(sid,year)] = sum of final pips
-    pivot_final= defaultdict(float)
-    # We do not build pivot for hc_x here.
-
-    allYears= sorted({k[1] for k in data.keys()})
-    for (sid_,y_,m_), buk in data.items():
-        pivot_final[(sid_,y_)] += sum(buk["pips_list"])
-
-    colStart=1
-    ws.cell(row=row,column=colStart, value="Year").font= Font(bold=True)
-    c_= colStart+1
-    for sid_ in (1,2,3,4):
-        ws.cell(row=row,column=c_, value=f"{STRATEGY_NAMES[sid_]}_final").font= Font(bold=True)
-        c_+=1
-    ws.cell(row=row,column=c_, value="Total_final").font= Font(bold=True)
-    # done, no more _hcXX columns
-    row+=1
-
-    for y_ in allYears:
-        c_= colStart
-        ws.cell(row=row,column=c_, value=y_)
-        c_+=1
-        yearTot= 0.0
-        for sid_ in (1,2,3,4):
-            val_ = pivot_final.get((sid_,y_), 0.0)
-            ws.cell(row=row,column=c_, value=round(val_,1))
-            c_+=1
-            yearTot+= val_
-        ws.cell(row=row,column=c_, value=round(yearTot,1))
-        row+=1
-
-    row+=2
-
-    # (5) Major Metrics table
-    ws.cell(row=row,column=1,value="(5) Major Metrics Table").font= Font(bold=True)
-    row+=2
-
-    rowHeaders= [
-      "Session1","Session2",
-      "Zone1","Zone2","Zone3","Zone4",
-      "Dist45_69","Dist70_99","Dist100_129","Dist130_plus"
-    ]
-    ws.cell(row=row,column=1,value="Strategy").font= Font(bold=True)
-    ws.cell(row=row,column=2,value="MetricName").font= Font(bold=True)
-    c_=3
-    sorted_yrs= sorted(yrs_in)
-    for y_ in sorted_yrs:
-        ws.cell(row=row,column=c_, value=str(y_)).font= Font(bold=True)
-        c_+=1
-    ws.cell(row=row,column=c_, value="All").font= Font(bold=True)
-    row+=1
-
-    def mm_sum(lst):
-        return sum(lst) if lst else 0.0
-
-    mmAllSid= defaultdict(major_metrics_factory)
-    for sid in sids_in:
-        for rH in rowHeaders:
-            ws.cell(row=row,column=1,value=STRATEGY_NAMES[sid])
-            ws.cell(row=row,column=2,value=rH)
-            c_=3
-            combinedAll= []
-            for y_ in sorted_yrs:
-                mmX= majorMetrics.get((sid,y_), None)
-                if not mmX:
-                    val=0.0
-                else:
-                    # e.g. "Zone1" => "zone1_list"
-                    # "Dist100_129" => "dist100_129_list"
-                    key_= rH.lower()+"_list"
-                    if key_ not in mmX:
-                        val=0.0
-                    else:
-                        arr= mmX[key_]
-                        val= mm_sum(arr)
-                        combinedAll.extend(arr)
-                ws.cell(row=row,column=c_, value=round(val,1))
-                c_+=1
-            totVal= round(mm_sum(combinedAll),1)
-            ws.cell(row=row,column=c_, value=totVal)
-            mmAllSid[sid][key_].extend(combinedAll)
-            row+=1
-        row+=1
-
-    # final row for each strategy
-    for sid in sids_in:
-        ws.cell(row=row,column=1,value=f"{STRATEGY_NAMES[sid]}-All(Metrics)").font=Font(bold=True)
-        row+=1
-        for rH in rowHeaders:
-            key_= rH.lower()+"_list"
-            arr= mmAllSid[sid][key_]
-            val_= mm_sum(arr)
-            ws.cell(row=row,column=2,value=rH).font=Font(bold=True)
-            ws.cell(row=row,column=3,value=round(val_,1)).font=Font(bold=True)
-            row+=1
-        row+=2
-
+    row = 1
     # (6) “Optimal Levels Analysis”
-    row+=1
-    ws.cell(row=row,column=1,value="(6) Optimal Levels Analysis").font=Font(bold=True)
-    row+=2
+    row += 1
+    ws.cell(row=row, column=1, value="(6) Optimal Levels Analysis").font = Font(bold=True)
+    row += 2
 
-    headers_6= [
-      "Strategy","Trades",
-      "Hit_50%","Hit_60%","Hit_70%","Hit_80%","Hit_90%","Hit_100%",
-      "Net@50","Net@60","Net@70","Net@80","Net@90","Net@100",
-      "Best_TP","Best_Net","Median_DD","P75_DD","Suggested_SL_Range"
+    headers_6 = [
+        "Strategy", "Trades",
+        "Hit_50%", "Hit_60%", "Hit_70%", "Hit_80%", "Hit_90%", "Hit_100%",
+        "Net@50", "Net@60", "Net@70", "Net@80", "Net@90", "Net@100",
+        "Best_TP", "Best_Net", "Median_DD", "P75_DD", "Suggested_SL_Range"
     ]
-    for c_i, hh in enumerate(headers_6,1):
-        ws.cell(row=row,column=c_i,value=hh).font= Font(bold=True)
-    row+=1
+    for c_i, hh in enumerate(headers_6, 1):
+        ws.cell(row=row, column=c_i, value=hh).font = Font(bold=True)
+    row += 1
 
-    def pct(a,b):
-        return round(a/b*100,1) if b>0 else 0.0
+    def pct(a, b):
+        return round(a / b * 100, 1) if b > 0 else 0.0
 
     for sid in sids_in:
-        trades= STRAT_STATE[sid]["closedTrades"]
-        n= len(trades)
-        if n==0:
+        trades = STRAT_STATE[sid]["closedTrades"]
+        n = len(trades)
+        if n == 0:
             continue
-        hit_ct= {L:0 for L in(50,60,70,80,90,100)}
-        net_if= {L:0.0 for L in(50,60,70,80,90,100)}
-        dd_list= []
+        hit_ct = {L: 0 for L in (50, 60, 70, 80, 90, 100)}
+        net_if = {L: 0.0 for L in (50, 60, 70, 80, 90, 100)}
+        dd_list = []
         for cT in trades:
-            pk= cT["peakProfitPips"]
-            real= cT["pips"]
+            pk = cT["peakProfitPips"]
             dd_list.append(cT["peakDrawdownPips"])
-            for L in (50,60,70,80,90,100):
-                if pk< L:
-                    net_if[L]+= real
-                else:
-                    net_if[L]+= L
-                    hit_ct[L]+=1
+            for L in (50, 60, 70, 80, 90, 100):
+                net_if[L] += cT[f"hc_{L}"]
+                if pk >= L:
+                    hit_ct[L] += 1
 
         from statistics import median as stat_median
         dd_list.sort()
-        med_dd= stat_median(dd_list) if dd_list else 0
-        i75= int(0.75*len(dd_list))
-        p75= dd_list[i75] if i75<len(dd_list) else med_dd
-        hint_= f"{round(med_dd)}–{round(p75)}"
+        med_dd = stat_median(dd_list) if dd_list else 0
+        i75 = int(0.75 * len(dd_list))
+        p75 = dd_list[i75] if i75 < len(dd_list) else med_dd
+        hint_ = f"{round(med_dd)}–{round(p75)}"
 
-        best_L, best_val= max(net_if.items(), key=lambda kv: kv[1])
+        best_L, best_val = max(net_if.items(), key=lambda kv: kv[1])
 
-        c=1
-        ws.cell(row=row,column=c,value=STRATEGY_NAMES[sid]); c+=1
-        ws.cell(row=row,column=c,value=n); c+=1
-        for L in (50,60,70,80,90,100):
-            ws.cell(row=row,column=c,value= pct(hit_ct[L],n)); c+=1
-        for L in (50,60,70,80,90,100):
-            cell= ws.cell(row=row,column=c,value= round(net_if[L],1))
-            if L== best_L:
-                cell.fill= PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            c+=1
+        c = 1
+        ws.cell(row=row, column=c, value=STRATEGY_NAMES[sid])
+        c += 1
+        ws.cell(row=row, column=c, value=n)
+        c += 1
+        for L in (50, 60, 70, 80, 90, 100):
+            ws.cell(row=row, column=c, value=pct(hit_ct[L], n))
+            c += 1
+        for L in (50, 60, 70, 80, 90, 100):
+            cell = ws.cell(row=row, column=c, value=round(net_if[L], 1))
+            if L == best_L:
+                cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+            c += 1
 
-        ws.cell(row=row,column=c,value=best_L).fill= PatternFill(start_color="C6EFCE",end_color="C6EFCE",fill_type="solid"); c+=1
-        ws.cell(row=row,column=c,value=round(best_val,1)).fill= PatternFill(start_color="C6EFCE",end_color="C6EFCE",fill_type="solid"); c+=1
-        ws.cell(row=row,column=c,value=round(med_dd,1)); c+=1
-        ws.cell(row=row,column=c,value=round(p75,1)); c+=1
-        ws.cell(row=row,column=c,value= hint_); c+=1
+        ws.cell(row=row, column=c, value=best_L).fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        c += 1
+        ws.cell(row=row, column=c, value=round(best_val, 1)).fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        c += 1
+        ws.cell(row=row, column=c, value=round(med_dd, 1))
+        c += 1
+        ws.cell(row=row, column=c, value=round(p75, 1))
+        c += 1
 
-        row+=1
+        row += 1
 
     outp= pathlib.Path(out_dir)/ f"results_{date_tag}.xlsx"
     wb.save(outp)
